@@ -1,7 +1,7 @@
 /*
  * Asterisk -- An open source telephony toolkit.
  *
- * Copyright (C) 2015, Digium, Inc.
+ * Copyright (C) 2020, Vedga
  *
  * Igor Nikolaev <support@vedga.com>
  *
