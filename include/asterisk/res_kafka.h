@@ -21,15 +21,7 @@
 #ifndef _ASTERISK_RES_KAFKA_H
 #define _ASTERISK_RES_KAFKA_H
 
-#include "asterisk/stringfields.h"
-
-/*! Internal representation of message pipe */
-struct ast_kafka_pipe {
-	AST_DECLARE_STRING_FIELDS(
-		/*! Pipe id, used by Asterisk modules to produce or consume messages */
-		AST_STRING_FIELD(id);
-	);
-};
+struct ast_kafka_pipe;
 
 struct ast_kafka_pipe *ast_kafka_get_pipe(const char *pipe_id, int force);
 

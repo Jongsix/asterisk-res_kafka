@@ -160,6 +160,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 #include "asterisk/module.h"
 #include "asterisk/sorcery.h"
 #include "asterisk/astobj2.h"
+#include "asterisk/linkedlists.h"
 #include "asterisk/cli.h"
 #include "asterisk/stringfields.h"
 
@@ -238,14 +239,29 @@ struct kafka_producer {
 	rd_kafka_t *rd_kafka;
 };
 
-struct kafka_producer_topic {
+/*! Internal representation of Kafka's topic */
+struct kafka_topic {
+	/*! Link to next topic on the list in ast_kafka_pipe */
+	AST_LIST_ENTRY(kafka_topic) link;
 	rd_kafka_topic_t *rd_kafka_topic;
+};
+
+/*! Internal representation of message pipe */
+struct ast_kafka_pipe {
+	AST_DECLARE_STRING_FIELDS(
+		/*! Pipe id, used by Asterisk modules to produce or consume messages */
+		AST_STRING_FIELD(id);
+	);
+	/*! List of producer's topics for this pipe */
+	AST_LIST_HEAD(producer_topics_s, kafka_topic) producer_topics;
+	/*! List of consumer's topics for this pipe */
+	AST_LIST_HEAD(consumer_topics_s, kafka_topic) consumer_topics;
 };
 
 
 
-
 static char *handle_kafka_show(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *complete_pipe_choice(const char *word);
 static int show_pipes_cb(void *obj, void *arg, int flags);
 
 //static rd_kafka_t *kafka_get_producer(struct sorcery_kafka_cluster *cluster);
@@ -269,7 +285,7 @@ static rd_kafka_conf_t *build_rdkafka_cluster_config(const struct sorcery_kafka_
 static void process_producer_topic(struct kafka_producer *producer, const struct sorcery_kafka_topic *sorcery_topic);
 static void process_consumer_topic(const struct sorcery_kafka_cluster *sorcery_cluster, const struct sorcery_kafka_consumer *sorcery_consumer, const struct sorcery_kafka_topic *sorcery_topic);
 
-static struct kafka_producer_topic *new_kafka_producer_topic(struct kafka_producer *producer, const struct sorcery_kafka_topic *sorcery_topic);
+static struct kafka_topic *new_kafka_producer_topic(struct kafka_producer *producer, const struct sorcery_kafka_topic *sorcery_topic);
 static void kafka_producer_topic_destructor(void *obj);
 
 static int sorcery_object_register(const char *type, void *(*alloc)(const char *name),int (*apply)(const struct ast_sorcery *sorcery, void *obj));
@@ -329,37 +345,83 @@ struct ast_kafka_pipe *ast_kafka_get_pipe(const char *pipe_id, int force) {
 }
 
 static char *handle_kafka_show(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a) {
-	static const char *choices[] = {
+	static const char *option[] = {
 		"version",
-		"clusters",
 		"pipes",
+		"pipe",
 		NULL,
 	};
-	int qualifier;
+	static const char *pipe_option[] = {
+		"producer",
+		"consumer",
+		NULL,
+	};
+//	int qualifier;
 
 	switch(cmd) {
 	case CLI_INIT:
 		e->command = "kafka show";
 		e->usage =
-			"Usage: kafka show version|clusters|pipes\n"
+			"Usage: kafka show version|pipes|pipe\n"
 			"       Show the version of librdkafka that res_kafka is running against\n";
 		return NULL;
 	case CLI_GENERATE:
-		if(a->pos > e->args) {
+		switch(a->pos) {
+		case 2:
+			/* "kafka show" */
+			return ast_cli_complete(a->word, option, a->n);
+		case 3:
+			/* "kafka show some"*/
+			if(0 == strcasecmp(a->argv[2], option[2])) {
+				/* "kafka show pipe"*/
+				return complete_pipe_choice(a->word);
+			}
+			return NULL;
+		case 4:
+			if(0 == strcasecmp(a->argv[2], option[2])) {
+				/* "kafka show pipe <pipe_id>"*/
+				return ast_cli_complete(a->word, pipe_option, a->n);
+			}
+			return NULL;
+		default:
+			/* No completion choices */
 			return NULL;
 		}
-
-		return ast_cli_complete(a->word, choices, a->n);
 	default:
-		if(a->argc > e->args + 1) {
-			return CLI_SHOWUSAGE;
-		}
+//		if(a->argc > e->args + 1) {
+//			return CLI_SHOWUSAGE;
+//		}
 
 		break;
 	}
 
-	for(qualifier = 0; qualifier < ARRAY_LEN(choices); qualifier++) {
-		if(0 == strcmp(a->argv[2], choices[qualifier])) {
+#if 1
+	if(3 == a->argc) {
+		if(0 == strcasecmp(a->argv[2], option[0])) {
+			/* "kafka show version" */
+			ast_cli(a->fd, "librdkafka version currently running against: %s\n", rd_kafka_version_str());
+			return CLI_SUCCESS;
+		}
+
+		if(0 == strcasecmp(a->argv[2], option[1])) {
+			/* "kafka show pipes" */
+			ao2_callback(pipes, OBJ_NODATA, show_pipes_cb, a);
+			return CLI_SUCCESS;
+		}
+		return CLI_SHOWUSAGE;
+	}
+
+	if(5 == a->argc) {
+		if(0 == strcasecmp(a->argv[2], option[2])) {
+			/* "kafka show pipe <pipe_id> consumer|producer" */
+			ast_cli(a->fd, "Got 'kafka show pipe %s %s'\n", a->argv[3], a->argv[4]);
+		}
+	}
+
+	return CLI_SHOWUSAGE;
+#else
+	for(qualifier = 0; qualifier < ARRAY_LEN(option); qualifier++) {
+		if(0 == strcmp(a->argv[2], option[qualifier])) {
 			break;
 		}
 	}
@@ -369,16 +431,37 @@ static char *handle_kafka_show(struct ast_cli_entry *e, int cmd, struct ast_cli_
 		ast_cli(a->fd, "librdkafka version currently running against: %s\n", rd_kafka_version_str());
 		break;
 	case 1:
-		ast_cli(a->fd, "Show clusters...\n");
+		ao2_callback(pipes, OBJ_NODATA, show_pipes_cb, a);
 		break;
 	case 2:
-		ao2_callback(pipes, OBJ_NODATA, show_pipes_cb, a);
+		ast_cli(a->fd, "Show clusters...\n");
 		break;
 	default:
 		return CLI_SHOWUSAGE;
 	}
 
 	return CLI_SUCCESS;
+#endif
+}
+
+static char *complete_pipe_choice(const char *word) {
+	int wordlen = strlen(word);
+	struct ao2_iterator i;
+	void *obj;
+
+	i = ao2_iterator_init(pipes, 0);
+	while(NULL != (obj = ao2_iterator_next(&i))) {
+		struct ast_kafka_pipe *pipe = obj;
+
+		if(0 == strncasecmp(word, pipe->id, wordlen)) {
+			ast_cli_completion_add(ast_strdup(pipe->id));
+		}
+
+		ao2_ref(obj, -1);
+	}
+	ao2_iterator_destroy(&i);
+
+	return NULL;
 }
 
 /*! Show registered pipes */
@@ -691,10 +774,30 @@ static rd_kafka_conf_t *build_rdkafka_cluster_config(const struct sorcery_kafka_
 
 /*! Process Kafka producer related topic at the cluster */
 static void process_producer_topic(struct kafka_producer *producer, const struct sorcery_kafka_topic *sorcery_topic) {
-	struct kafka_producer_topic *topic;
+#if 1
+	RAII_VAR(struct kafka_topic *, topic, new_kafka_producer_topic(producer, sorcery_topic), ao2_cleanup);
+	RAII_VAR(struct ast_kafka_pipe *, pipe, ast_kafka_get_pipe(sorcery_topic->pipe, 1), ao2_cleanup);
+
+	if(pipe && topic) {
+		AST_LIST_LOCK(&pipe->producer_topics);
+
+		/* Add new topic to the specified pipe */
+		AST_LIST_INSERT_TAIL(&pipe->producer_topics, topic, link);
+
+		/* Object in the list */
+		ao2_ref(topic, +1);
+
+		AST_LIST_UNLOCK(&pipe->producer_topics);
+	} else {
+		ast_log(LOG_ERROR, "Unable to add producer topic '%s' to pipe '%s' - Out of memory\n", 
+			ast_sorcery_object_get_id(sorcery_topic), sorcery_topic->pipe);
+	}
+
+#else
+	struct kafka_topic *topic;
 	rd_kafka_resp_err_t response;
 
-	struct ast_kafka_pipe *pipe = ast_kafka_get_pipe(sorcery_topic->pipe, 1); //kafka_pipe_alloc(sorcery_topic->pipe);
+	struct ast_kafka_pipe *pipe = ast_kafka_get_pipe(sorcery_topic->pipe, 1);
 	ao2_cleanup(pipe);
 
 	ast_debug(3, "Process Kafka topic %s for producer %p\n", ast_sorcery_object_get_id(sorcery_topic), producer);
@@ -710,6 +813,7 @@ static void process_producer_topic(struct kafka_producer *producer, const struct
 	}
 
 	ao2_cleanup(topic);
+#endif
 }
 
 /*! Process Kafka consumer related topic at the cluster */
@@ -720,8 +824,8 @@ static void process_consumer_topic(const struct sorcery_kafka_cluster *sorcery_c
 
 
 
-static struct kafka_producer_topic *new_kafka_producer_topic(struct kafka_producer *producer, const struct sorcery_kafka_topic *sorcery_topic) {
-	struct kafka_producer_topic *topic = ao2_alloc(sizeof(*topic), kafka_producer_topic_destructor);
+static struct kafka_topic *new_kafka_producer_topic(struct kafka_producer *producer, const struct sorcery_kafka_topic *sorcery_topic) {
+	struct kafka_topic *topic = ao2_alloc(sizeof(*topic), kafka_producer_topic_destructor);
 
 	if(NULL == topic) {
 		ast_log(LOG_ERROR, "Out of memory while create producer topic '%s'\n", ast_sorcery_object_get_id(sorcery_topic));
@@ -755,10 +859,10 @@ static struct kafka_producer_topic *new_kafka_producer_topic(struct kafka_produc
 }
 
 static void kafka_producer_topic_destructor(void *obj) {
-	struct kafka_producer_topic *topic = obj;
+	struct kafka_topic *topic = obj;
 
 	if(topic->rd_kafka_topic) {
-		ast_debug(3, "Destroy rd_kafka_topic_t object %p on producer topic %p\n", topic->rd_kafka_topic, topic);
+		ast_debug(3, "Destroy rd_kafka_topic_t object %p on topic %p\n", topic->rd_kafka_topic, topic);
 		rd_kafka_topic_destroy(topic->rd_kafka_topic);
 	}
 }
@@ -948,6 +1052,10 @@ static void *kafka_pipe_alloc(const char *pipe_id) {
 		return NULL;
 	}
 
+	AST_LIST_HEAD_INIT(&pipe->producer_topics);
+
+	AST_LIST_HEAD_INIT(&pipe->consumer_topics);
+
 	if(ast_string_field_init(pipe, 64)) {
 		ao2_cleanup(pipe);
 		return NULL;
@@ -963,11 +1071,33 @@ static void *kafka_pipe_alloc(const char *pipe_id) {
 /*! Pipe object destructor */
 static void kafka_pipe_destructor(void *obj) {
 	struct ast_kafka_pipe *pipe = obj;
+	struct kafka_topic *topic;
+
+	AST_LIST_LOCK(&pipe->consumer_topics);
+
+	while(NULL != (topic = AST_LIST_REMOVE_HEAD(&pipe->consumer_topics, link))) {
+		/* Release object */
+		ao2_ref(topic, -1);
+	}
+
+	AST_LIST_UNLOCK(&pipe->consumer_topics);
+
+	AST_LIST_HEAD_DESTROY(&pipe->consumer_topics);
+
+	AST_LIST_LOCK(&pipe->producer_topics);
+
+	while(NULL != (topic = AST_LIST_REMOVE_HEAD(&pipe->producer_topics, link))) {
+		/* Release object */
+		ao2_ref(topic, -1);
+	}
+
+	AST_LIST_UNLOCK(&pipe->producer_topics);
+
+	AST_LIST_HEAD_DESTROY(&pipe->producer_topics);
 
 	ast_debug(3, "Destroyed Kafka pipe %s (%p)\n", pipe->id, pipe);
 
 	ast_string_field_free_memory(pipe);
-
 }
 
 /*! Calculate hash */
