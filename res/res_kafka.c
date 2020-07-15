@@ -133,6 +133,9 @@
 				<configOption name="type">
 					<synopsis>Must be of type 'topic'</synopsis>
 				</configOption>
+				<configOption name="pipe">
+					<synopsis>Asterisk messages pipe name</synopsis>
+				</configOption>
 				<configOption name="topic">
 					<synopsis>Kafka topic name</synopsis>
 				</configOption>
@@ -158,6 +161,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 #include "asterisk/sorcery.h"
 #include "asterisk/astobj2.h"
 #include "asterisk/cli.h"
+#include "asterisk/stringfields.h"
 
 #include "librdkafka/rdkafka.h"
 
@@ -168,6 +172,9 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 #define KAFKA_PRODUCER "producer"
 #define KAFKA_CONSUMER "consumer"
 #define KAFKA_ERRSTR_MAX_SIZE 80
+
+/*! Buckets for pipe hash. Keep it prime! */
+#define KAFKA_PIPE_BUCKETS 127
 
 /*! Kafka cluster common parameters */
 struct sorcery_kafka_cluster {
@@ -216,6 +223,8 @@ struct sorcery_kafka_consumer {
 struct sorcery_kafka_topic {
 	SORCERY_OBJECT(defails);
 	AST_DECLARE_STRING_FIELDS(
+		/*! Pipe id, used by Asterisk modules to produce or consume messages */
+		AST_STRING_FIELD(pipe);
 		/*! Kafka topic name */
 		AST_STRING_FIELD(topic);
 		/*! Producer resource id */
@@ -234,7 +243,11 @@ struct kafka_producer_topic {
 };
 
 
-static char *handle_kafka_show_version(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+
+
+static char *handle_kafka_show(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static int show_pipes_cb(void *obj, void *arg, int flags);
+
 //static rd_kafka_t *kafka_get_producer(struct sorcery_kafka_cluster *cluster);
 
 static void on_producer_created(const void *obj);
@@ -273,9 +286,11 @@ static int sorcery_kafka_cluster_apply_handler(const struct ast_sorcery *sorcery
 static void *sorcery_kafka_cluster_alloc(const char *name);
 static void sorcery_kafka_cluster_destructor(void *obj);
 
+static void *kafka_pipe_alloc(const char *pipe_id);
+static void kafka_pipe_destructor(void *obj);
 
 static struct ast_cli_entry kafka_cli[] = {
-	AST_CLI_DEFINE(handle_kafka_show_version, "Show the version of librdkafka in use"),
+	AST_CLI_DEFINE(handle_kafka_show, "Show module data"),
 };
 
 static const struct ast_sorcery_observer producer_observers = {
@@ -288,26 +303,93 @@ static const struct ast_sorcery_observer producer_observers = {
 /*! Sorcery */
 static struct ast_sorcery *kafka_sorcery;
 
+/*! Defined pipes container */
+static struct ao2_container *pipes;
 
-static char *handle_kafka_show_version(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a) {
+
+/*! Module API: Get existing pipe or create new if not present */
+struct ast_kafka_pipe *ast_kafka_get_pipe(const char *pipe_id, int force) {
+	struct ast_kafka_pipe *pipe;
+
+	ao2_lock(pipes);
+
+	if((NULL == (pipe = ao2_find(pipes, pipe_id, OBJ_SEARCH_KEY|OBJ_NOLOCK))) && force) {
+		/* Pipe with requested id not found */
+		if(NULL != (pipe = kafka_pipe_alloc(pipe_id))) {
+			/* Add new pipe to the container */
+			ao2_link_flags(pipes, pipe, OBJ_NOLOCK);
+
+			ast_debug(3, "New Kafka pipe %s (%p) added to the container\n", pipe->id, pipe);
+		}
+	}
+
+	ao2_unlock(pipes);
+
+	return pipe;
+}
+
+static char *handle_kafka_show(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a) {
+	static const char *choices[] = {
+		"version",
+		"clusters",
+		"pipes",
+		NULL,
+	};
+	int qualifier;
+
 	switch(cmd) {
 	case CLI_INIT:
-		e->command = "kafka show version";
+		e->command = "kafka show";
 		e->usage =
-			"Usage: kafka show version\n"
+			"Usage: kafka show version|clusters|pipes\n"
 			"       Show the version of librdkafka that res_kafka is running against\n";
 		return NULL;
 	case CLI_GENERATE:
-		return NULL;
+		if(a->pos > e->args) {
+			return NULL;
+		}
+
+		return ast_cli_complete(a->word, choices, a->n);
 	default:
+		if(a->argc > e->args + 1) {
+			return CLI_SHOWUSAGE;
+		}
+
 		break;
 	}
 
-	ast_cli(a->fd, "librdkafka version currently running against: %s\n", rd_kafka_version_str());
+	for(qualifier = 0; qualifier < ARRAY_LEN(choices); qualifier++) {
+		if(0 == strcmp(a->argv[2], choices[qualifier])) {
+			break;
+		}
+	}
+
+	switch(qualifier) {
+	case 0:
+		ast_cli(a->fd, "librdkafka version currently running against: %s\n", rd_kafka_version_str());
+		break;
+	case 1:
+		ast_cli(a->fd, "Show clusters...\n");
+		break;
+	case 2:
+		ao2_callback(pipes, OBJ_NODATA, show_pipes_cb, a);
+		break;
+	default:
+		return CLI_SHOWUSAGE;
+	}
 
 	return CLI_SUCCESS;
 }
 
+/*! Show registered pipes */
+static int show_pipes_cb(void *obj, void *arg, int flags) {
+	struct ast_kafka_pipe *pipe = obj;
+	struct ast_cli_args *a = arg;
+
+	ast_cli(a->fd, "%s\n", pipe->id);
+
+	return 0;
+}
 
 #if 0
 static rd_kafka_t *kafka_get_producer(struct sorcery_kafka_cluster *cluster) {
@@ -499,7 +581,6 @@ static int process_consumer(const struct sorcery_kafka_cluster *cluster, const s
 
 	rd_kafka_conf_destroy(config);
 
-
 	if(NULL == (found = ast_sorcery_retrieve_by_fields(kafka_sorcery, KAFKA_TOPIC, AST_RETRIEVE_FLAG_MULTIPLE, filter))) {
 		ast_log(LOG_WARNING, "Unable to retrieve topics from consumer %s at cluster %s\n", ast_sorcery_object_get_id(consumer), ast_sorcery_object_get_id(cluster));
 	} else {
@@ -613,6 +694,9 @@ static void process_producer_topic(struct kafka_producer *producer, const struct
 	struct kafka_producer_topic *topic;
 	rd_kafka_resp_err_t response;
 
+	struct ast_kafka_pipe *pipe = ast_kafka_get_pipe(sorcery_topic->pipe, 1); //kafka_pipe_alloc(sorcery_topic->pipe);
+	ao2_cleanup(pipe);
+
 	ast_debug(3, "Process Kafka topic %s for producer %p\n", ast_sorcery_object_get_id(sorcery_topic), producer);
 
 	topic = new_kafka_producer_topic(producer, sorcery_topic);
@@ -654,12 +738,12 @@ static struct kafka_producer_topic *new_kafka_producer_topic(struct kafka_produc
 
 		/* With topic's callbacks we want see the kafka_producer_topic structure reference */
 		rd_kafka_topic_conf_set_opaque(config, topic);
-		ao2_ref(topic, +1); //!!! круговая зависимость!!!
+//!!!		ao2_ref(topic, +1); //!!! круговая зависимость!!!
 
 		if(NULL == (topic->rd_kafka_topic = rd_kafka_topic_new(producer->rd_kafka, sorcery_topic->topic, config))) {
 			ast_log(LOG_ERROR, "Unable to create producer topic '%s' because %s\n", ast_sorcery_object_get_id(sorcery_topic), rd_kafka_err2str(rd_kafka_last_error()));
 			rd_kafka_topic_conf_destroy(config);
-			ao2_ref(topic, -1);
+//!!!			ao2_ref(topic, -1);
 
 			/* This object not usable */
 			ao2_ref(topic, -1);
@@ -856,16 +940,59 @@ static void sorcery_kafka_cluster_destructor(void *obj) {
 	ast_string_field_free_memory(cluster);
 }
 
+/*! Create new pipe object with specified pipe name */
+static void *kafka_pipe_alloc(const char *pipe_id) {
+	struct ast_kafka_pipe *pipe = ao2_alloc(sizeof(*pipe), kafka_pipe_destructor);
+
+	if(NULL == pipe) {
+		return NULL;
+	}
+
+	if(ast_string_field_init(pipe, 64)) {
+		ao2_cleanup(pipe);
+		return NULL;
+	}
+
+	ast_string_field_set(pipe, id, pipe_id);
+
+	ast_debug(3, "Allocated Kafka pipe %s (%p)\n", pipe->id, pipe);
+
+	return pipe;
+}
+
+/*! Pipe object destructor */
+static void kafka_pipe_destructor(void *obj) {
+	struct ast_kafka_pipe *pipe = obj;
+
+	ast_debug(3, "Destroyed Kafka pipe %s (%p)\n", pipe->id, pipe);
+
+	ast_string_field_free_memory(pipe);
+
+}
+
+/*! Calculate hash */
+AO2_STRING_FIELD_HASH_FN(ast_kafka_pipe, id)
+/*! Compare pipes */
+AO2_STRING_FIELD_CMP_FN(ast_kafka_pipe, id)
+
 static int load_module(void) {
+	if(NULL == (pipes = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, KAFKA_PIPE_BUCKETS, ast_kafka_pipe_hash_fn, NULL, ast_kafka_pipe_cmp_fn))) {
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
 	if(NULL == (kafka_sorcery = ast_sorcery_open())) {
 		ast_log(LOG_ERROR, "Failed to open Kafka sorcery.\n");
 
+		ao2_cleanup(pipes);
+		pipes = NULL;
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	if(sorcery_object_register(KAFKA_CLUSTER, sorcery_kafka_cluster_alloc, sorcery_kafka_cluster_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
+		ao2_cleanup(pipes);
+		pipes = NULL;
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
@@ -881,9 +1008,12 @@ static int load_module(void) {
 	if(sorcery_object_register(KAFKA_TOPIC, sorcery_kafka_topic_alloc, sorcery_kafka_topic_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
+		ao2_cleanup(pipes);
+		pipes = NULL;
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "pipe", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_topic, pipe));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "topic", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_topic, topic));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "producer", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_topic, producer_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "consumer", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_topic, consumer_id));
@@ -891,6 +1021,8 @@ static int load_module(void) {
 	if(sorcery_object_register(KAFKA_PRODUCER, sorcery_kafka_producer_alloc, sorcery_kafka_producer_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
+		ao2_cleanup(pipes);
+		pipes = NULL;
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
@@ -902,6 +1034,8 @@ static int load_module(void) {
 		ast_log(LOG_ERROR, "Failed to register observer for '%s' with Kafka sorcery.\n", KAFKA_PRODUCER);
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
+		ao2_cleanup(pipes);
+		pipes = NULL;
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
@@ -910,6 +1044,8 @@ static int load_module(void) {
 	if(sorcery_object_register(KAFKA_CONSUMER, sorcery_kafka_consumer_alloc, sorcery_kafka_consumer_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
+		ao2_cleanup(pipes);
+		pipes = NULL;
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
@@ -938,6 +1074,8 @@ static int unload_module(void) {
 	ast_sorcery_unref(kafka_sorcery);
 	kafka_sorcery = NULL;
 
+	ao2_cleanup(pipes);
+	pipes = NULL;
 
 	return 0;
 }
