@@ -286,18 +286,22 @@ static void on_producer_loaded(const char *type);
 static void process_all_clusters(void);
 static void process_cluster(const struct sorcery_kafka_cluster *cluster);
 static int process_producer(const struct sorcery_kafka_cluster *sorcery_cluster, const struct sorcery_kafka_producer *sorcery_producer);
-static int process_consumer(const struct sorcery_kafka_cluster *cluster, const struct sorcery_kafka_consumer *consumer);
+static int process_consumer(const struct sorcery_kafka_cluster *sorcery_cluster, const struct sorcery_kafka_consumer *sorcery_consumer);
 
 static struct kafka_service *new_kafka_producer(const struct sorcery_kafka_cluster *sorcery_cluster, const struct sorcery_kafka_producer *sorcery_producer);
 static void kafka_producer_destructor(void *obj);
+static struct kafka_service *new_kafka_consumer(const struct sorcery_kafka_cluster *sorcery_cluster, const struct sorcery_kafka_consumer *sorcery_consumer);
+static void kafka_consumer_destructor(void *obj);
 
 static rd_kafka_conf_t *build_rdkafka_cluster_config(const struct sorcery_kafka_cluster *cluster);
 
 static void process_producer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic);
-static void process_consumer_topic(const struct sorcery_kafka_cluster *sorcery_cluster, const struct sorcery_kafka_consumer *sorcery_consumer, const struct sorcery_kafka_topic *sorcery_topic);
+static void process_consumer_topic(struct kafka_service *consumer, const struct sorcery_kafka_topic *sorcery_topic);
 
 static struct kafka_topic *new_kafka_producer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic);
 static void kafka_producer_topic_destructor(void *obj);
+static struct kafka_topic *new_kafka_consumer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic);
+static void kafka_consumer_topic_destructor(void *obj);
 
 static int on_all_producer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaqe_1, void *opaqe_2, struct ast_kafka_pipe *pipe), void *opaqe_1, void *opaqe_2);
 static int on_all_consumer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaqe_1, void *opaqe_2, struct ast_kafka_pipe *pipe), void *opaqe_1, void *opaqe_2);
@@ -438,7 +442,7 @@ static char *handle_kafka_show(struct ast_cli_entry *e, int cmd, struct ast_cli_
 
 				if((0 == strcasecmp(a->argv[4], pipe_option[0])) || (0 == strcasecmp(a->argv[4], pipe_option[2]))) {
 					/* Show services or consumers */
-					on_all_consumer_topics(pipe, cli_show_topic_cb, a, (char*)option[2]);
+					on_all_consumer_topics(pipe, cli_show_topic_cb, a, (char*)pipe_option[2]);
 				}
 			}
 
@@ -507,8 +511,6 @@ static int cli_show_topic_cb(struct kafka_topic *topic, void *opaqe_1, void *opa
 	} else {
 		ast_log(LOG_ERROR, "Kafka get metadata got error: %s\n", rd_kafka_err2str(response));
 	}
-
-//	ast_cli(a->fd, "Show service %s, topic=%p, service=%p\n", service_type, topic, service);
 
 	return 0;
 }
@@ -690,42 +692,35 @@ static int process_producer(const struct sorcery_kafka_cluster *sorcery_cluster,
 }
 
 /*! Process Kafka consumer at the cluster */
-static int process_consumer(const struct sorcery_kafka_cluster *cluster, const struct sorcery_kafka_consumer *consumer) {
-	RAII_VAR(struct ast_variable *, filter, ast_variable_new("consumer", ast_sorcery_object_get_id(consumer), ""), ast_variables_destroy);
+static int process_consumer(const struct sorcery_kafka_cluster *sorcery_cluster, const struct sorcery_kafka_consumer *sorcery_consumer) {
+	RAII_VAR(struct ast_variable *, filter, ast_variable_new("consumer", ast_sorcery_object_get_id(sorcery_consumer), ""), ast_variables_destroy);
 	RAII_VAR(struct ao2_container *, found, NULL, ao2_cleanup);
-	rd_kafka_conf_t *config = build_rdkafka_cluster_config(cluster);
 
-	ast_debug(3, "Process Kafka consumer %s on cluster %s\n", ast_sorcery_object_get_id(consumer),ast_sorcery_object_get_id(cluster));
-
-	if(NULL == config) {
-		return -1;
-	}
-
-	rd_kafka_conf_destroy(config);
+	ast_debug(3, "Process Kafka consumer %s on cluster %s\n", ast_sorcery_object_get_id(sorcery_consumer), ast_sorcery_object_get_id(sorcery_cluster));
 
 	if(NULL == (found = ast_sorcery_retrieve_by_fields(kafka_sorcery, KAFKA_TOPIC, AST_RETRIEVE_FLAG_MULTIPLE, filter))) {
-		ast_log(LOG_WARNING, "Unable to retrieve topics from consumer %s at cluster %s\n", ast_sorcery_object_get_id(consumer), ast_sorcery_object_get_id(cluster));
+		ast_log(LOG_WARNING, "Unable to retrieve topics from consumer %s at cluster %s\n", ast_sorcery_object_get_id(sorcery_consumer), ast_sorcery_object_get_id(sorcery_cluster));
 	} else {
 		if(ao2_container_count(found)) {
 			/* Consumers present */
-			rd_kafka_conf_t *config = build_rdkafka_cluster_config(cluster);
-			struct ao2_iterator i;
-			struct sorcery_kafka_topic *topic;
+			struct kafka_service *consumer = new_kafka_consumer(sorcery_cluster, sorcery_consumer);
 
-			if(NULL == config) {
+			if(NULL == consumer) {
 				return -1;
+			} else {
+				struct ao2_iterator i = ao2_iterator_init(found, 0);
+				struct sorcery_kafka_topic *sorcery_topic;
+
+				while(NULL != (sorcery_topic = ao2_iterator_next(&i))) {
+					process_consumer_topic(consumer, sorcery_topic);
+
+					ao2_ref(sorcery_topic, -1);
+				}
+
+				ao2_iterator_destroy(&i);
+
+				ao2_ref(consumer, -1);
 			}
-
-			rd_kafka_conf_destroy(config); //!!!
-
-			i = ao2_iterator_init(found, 0);
-			while(NULL != (topic = ao2_iterator_next(&i))) {
-				process_consumer_topic(cluster, consumer, topic);
-
-				ao2_ref(topic, -1);
-			}
-
-			ao2_iterator_destroy(&i);
 		}
 	}
 
@@ -771,6 +766,48 @@ static void kafka_producer_destructor(void *obj) {
 		rd_kafka_destroy(producer->rd_kafka);
 	}
 }
+
+/*! Create new consumer service object */
+static struct kafka_service *new_kafka_consumer(const struct sorcery_kafka_cluster *sorcery_cluster, const struct sorcery_kafka_consumer *sorcery_consumer) {
+	rd_kafka_conf_t *config = build_rdkafka_cluster_config(sorcery_cluster);
+	struct kafka_service *consumer;
+
+	if(NULL == config) {
+		return NULL;
+	}
+
+	if(NULL == (consumer = ao2_alloc(sizeof(*consumer), kafka_consumer_destructor))) {
+		ast_log(LOG_ERROR, "Kafka cluster '%s': Unable to create consumer '%s' because Out of memory\n", ast_sorcery_object_get_id(sorcery_cluster), ast_sorcery_object_get_id(sorcery_consumer));
+	} else {
+		char *errstr = ast_alloca(KAFKA_ERRSTR_MAX_SIZE);
+
+		consumer->timeout_ms = sorcery_consumer->timeout_ms;
+
+		/* Attempt to creare librdkafka consumer */
+		if(NULL == (consumer->rd_kafka = rd_kafka_new(RD_KAFKA_CONSUMER, config, errstr, KAFKA_ERRSTR_MAX_SIZE))) {
+			ast_log(LOG_ERROR, "Kafka cluster '%s': unable to create consumer '%s' because %s\n", ast_sorcery_object_get_id(sorcery_cluster), ast_sorcery_object_get_id(sorcery_consumer), errstr);
+		} else {
+			return consumer;
+		}
+	}
+
+	rd_kafka_conf_destroy(config);
+
+	ao2_cleanup(consumer);
+
+	return NULL;
+}
+
+static void kafka_consumer_destructor(void *obj) {
+	struct kafka_service *consumer = obj;
+
+	if(consumer->rd_kafka) {
+		ast_debug(3, "Destroy rd_kafka_t object %p on consumer %p\n", consumer->rd_kafka, consumer);
+		rd_kafka_destroy(consumer->rd_kafka);
+	}
+}
+
+
 
 /*! Build common rdkafka cluster configuration */
 static rd_kafka_conf_t *build_rdkafka_cluster_config(const struct sorcery_kafka_cluster *cluster) {
@@ -860,8 +897,24 @@ static void process_producer_topic(struct kafka_service *producer, const struct 
 }
 
 /*! Process Kafka consumer related topic at the cluster */
-static void process_consumer_topic(const struct sorcery_kafka_cluster *sorcery_cluster, const struct sorcery_kafka_consumer *sorcery_consumer, const struct sorcery_kafka_topic *sorcery_topic) {
-	ast_debug(3, "Process Kafka topic %s for consumer %s on cluster %s\n", ast_sorcery_object_get_id(sorcery_topic), ast_sorcery_object_get_id(sorcery_consumer), ast_sorcery_object_get_id(sorcery_cluster));
+static void process_consumer_topic(struct kafka_service *consumer, const struct sorcery_kafka_topic *sorcery_topic) {
+	RAII_VAR(struct kafka_topic *, topic, new_kafka_consumer_topic(consumer, sorcery_topic), ao2_cleanup);
+	RAII_VAR(struct ast_kafka_pipe *, pipe, ast_kafka_get_pipe(sorcery_topic->pipe, 1), ao2_cleanup);
+
+	if(pipe && topic) {
+		AST_LIST_LOCK(&pipe->consumer_topics);
+
+		/* Add new topic to the specified pipe */
+		AST_LIST_INSERT_TAIL(&pipe->consumer_topics, topic, link);
+
+		/* Object in the list */
+		ao2_ref(topic, +1);
+
+		AST_LIST_UNLOCK(&pipe->consumer_topics);
+	} else {
+		ast_log(LOG_ERROR, "Unable to add consumer topic '%s' to pipe '%s' - Out of memory\n", 
+			ast_sorcery_object_get_id(sorcery_topic), sorcery_topic->pipe);
+	}
 }
 
 
@@ -885,12 +938,10 @@ static struct kafka_topic *new_kafka_producer_topic(struct kafka_service *produc
 
 		/* With topic's callbacks we want see the kafka_producer_topic structure reference */
 		rd_kafka_topic_conf_set_opaque(config, topic);
-//!!!		ao2_ref(topic, +1); //!!! круговая зависимость!!!
 
 		if(NULL == (topic->rd_kafka_topic = rd_kafka_topic_new(producer->rd_kafka, sorcery_topic->topic, config))) {
 			ast_log(LOG_ERROR, "Unable to create producer topic '%s' because %s\n", ast_sorcery_object_get_id(sorcery_topic), rd_kafka_err2str(rd_kafka_last_error()));
 			rd_kafka_topic_conf_destroy(config);
-//!!!			ao2_ref(topic, -1);
 
 			/* This object not usable */
 			ao2_ref(topic, -1);
@@ -909,13 +960,67 @@ static void kafka_producer_topic_destructor(void *obj) {
 	struct kafka_topic *topic = obj;
 
 	if(topic->rd_kafka_topic) {
-		ast_debug(3, "Destroy rd_kafka_topic_t object %p on topic %p\n", topic->rd_kafka_topic, topic);
+		ast_debug(3, "Destroy rd_kafka_topic_t object %p on producer's topic %p\n", topic->rd_kafka_topic, topic);
 		rd_kafka_topic_destroy(topic->rd_kafka_topic);
 	}
 
 	/* Release service object */
 	ao2_cleanup(topic->service);
 }
+
+
+//!!!
+static struct kafka_topic *new_kafka_consumer_topic(struct kafka_service *consumer, const struct sorcery_kafka_topic *sorcery_topic) {
+	struct kafka_topic *topic = ao2_alloc(sizeof(*topic), kafka_consumer_topic_destructor);
+
+	if(NULL == topic) {
+		ast_log(LOG_ERROR, "Out of memory while create consumer topic '%s'\n", ast_sorcery_object_get_id(sorcery_topic));
+	} else {
+		rd_kafka_topic_conf_t *config = rd_kafka_topic_conf_new();
+
+		topic->rd_kafka_topic = NULL;
+
+		if(NULL == config) {
+			ast_log(LOG_ERROR, "Unable to create config for consumer topic '%s'\n", ast_sorcery_object_get_id(sorcery_topic));
+			ao2_ref(topic, -1);
+			return NULL;
+		}
+
+		/* With topic's callbacks we want see the kafka_producer_topic structure reference */
+		rd_kafka_topic_conf_set_opaque(config, topic);
+
+		if(NULL == (topic->rd_kafka_topic = rd_kafka_topic_new(consumer->rd_kafka, sorcery_topic->topic, config))) {
+			ast_log(LOG_ERROR, "Unable to create consumer topic '%s' because %s\n", ast_sorcery_object_get_id(sorcery_topic), rd_kafka_err2str(rd_kafka_last_error()));
+			rd_kafka_topic_conf_destroy(config);
+
+			/* This object not usable */
+			ao2_ref(topic, -1);
+			return NULL;
+		}
+
+		/* Topic handle created, link this object to the service */
+		topic->service = consumer;
+		ao2_ref(consumer, +1);
+	}
+
+	return topic;
+}
+
+static void kafka_consumer_topic_destructor(void *obj) {
+	struct kafka_topic *topic = obj;
+
+	if(topic->rd_kafka_topic) {
+		ast_debug(3, "Destroy rd_kafka_topic_t object %p on consumer's topic %p\n", topic->rd_kafka_topic, topic);
+		rd_kafka_topic_destroy(topic->rd_kafka_topic);
+	}
+
+	/* Release service object */
+	ao2_cleanup(topic->service);
+}
+
+//!!!
+
+
 
 
 /*! Execute callback on all producer topics in the pipe */
