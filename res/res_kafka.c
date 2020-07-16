@@ -162,8 +162,10 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/module.h"
 #include "asterisk/sorcery.h"
+#include "asterisk/taskprocessor.h"
 #include "asterisk/astobj2.h"
 #include "asterisk/linkedlists.h"
+#include "asterisk/dlinkedlists.h"
 #include "asterisk/cli.h"
 #include "asterisk/stringfields.h"
 #include "asterisk/utils.h"
@@ -177,6 +179,8 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 #define KAFKA_PRODUCER "producer"
 #define KAFKA_CONSUMER "consumer"
 #define KAFKA_ERRSTR_MAX_SIZE 80
+
+#define KAFKA_TASKPROCESSOR_MONITOR_ID "kafka/monitor"
 
 /*! Buckets for pipe hash. Keep it prime! */
 #define KAFKA_PIPE_BUCKETS 127
@@ -241,10 +245,14 @@ struct sorcery_kafka_topic {
 
 /*! Internal representation of Kafka's producer or consumer service */
 struct kafka_service {
-	/* librdkafka producer's or consumer's handle */
+	/*! Link to next service on the global services (producers or consumers) list */
+	AST_RWDLLIST_ENTRY(kafka_service) link;
+	/*! librdkafka producer's or consumer's handle */
 	rd_kafka_t *rd_kafka;
-	/* Default service timeout, ms */
+	/*! Default service timeout, ms */
 	unsigned int timeout_ms;
+	/*! Linked topics (must be accessed with lock producers or customers variable) */
+	unsigned int topic_count;
 };
 
 /*! Internal representation of Kafka's topic */
@@ -264,9 +272,9 @@ struct ast_kafka_pipe {
 		AST_STRING_FIELD(id);
 	);
 	/*! List of producer's topics for this pipe */
-	AST_LIST_HEAD(producer_topics_s, kafka_topic) producer_topics;
+	AST_LIST_HEAD(/*producer_topics_s*/, kafka_topic) producer_topics;
 	/*! List of consumer's topics for this pipe */
-	AST_LIST_HEAD(consumer_topics_s, kafka_topic) consumer_topics;
+	AST_LIST_HEAD(/*consumer_topics_s*/, kafka_topic) consumer_topics;
 };
 
 
@@ -295,13 +303,16 @@ static void kafka_consumer_destructor(void *obj);
 
 static rd_kafka_conf_t *build_rdkafka_cluster_config(const struct sorcery_kafka_cluster *cluster);
 
-static void process_producer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic);
-static void process_consumer_topic(struct kafka_service *consumer, const struct sorcery_kafka_topic *sorcery_topic);
+static int process_producer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic);
+static int process_consumer_topic(struct kafka_service *consumer, const struct sorcery_kafka_topic *sorcery_topic);
 
 static struct kafka_topic *new_kafka_producer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic);
 static void kafka_producer_topic_destructor(void *obj);
 static struct kafka_topic *new_kafka_consumer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic);
 static void kafka_consumer_topic_destructor(void *obj);
+
+static int on_all_producers(int (*callback)(struct kafka_service *service, void *opaqe), void *opaqe, int lock, int wrlock);
+static int on_all_consumers(int (*callback)(struct kafka_service *service, void *opaqe), void *opaqe, int lock, int wrlock);
 
 static int on_all_producer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaqe_1, void *opaqe_2, struct ast_kafka_pipe *pipe), void *opaqe_1, void *opaqe_2);
 static int on_all_consumer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaqe_1, void *opaqe_2, struct ast_kafka_pipe *pipe), void *opaqe_1, void *opaqe_2);
@@ -335,6 +346,15 @@ static const struct ast_sorcery_observer producer_observers = {
 	.deleted = on_producer_deleted,
 	.loaded = on_producer_loaded,
 };
+
+/*! Module's taskprocessor */
+static struct ast_taskprocessor *kafka_tps;
+
+/*! List of active producers */
+static AST_RWLIST_HEAD(kafka_producers_head_t, kafka_service) producers;
+
+/*! List of active consumers */
+static AST_RWLIST_HEAD(kafka_consumers_head_t, kafka_service) consumers;
 
 /*! Sorcery */
 static struct ast_sorcery *kafka_sorcery;
@@ -676,14 +696,26 @@ static int process_producer(const struct sorcery_kafka_cluster *sorcery_cluster,
 				struct sorcery_kafka_topic *sorcery_topic;
 
 				while(NULL != (sorcery_topic = ao2_iterator_next(&i))) {
-					process_producer_topic(producer, sorcery_topic);
+					if(0 == process_producer_topic(producer, sorcery_topic)) {
+						producer->topic_count++;
+					}
 
 					ao2_ref(sorcery_topic, -1);
 				}
 
 				ao2_iterator_destroy(&i);
 
-				ao2_ref(producer, -1);
+				if(producer->topic_count) {
+					AST_RWDLLIST_WRLOCK(&producers);
+
+					/* Keep object reference count because list reference to it */
+					AST_RWDLLIST_INSERT_TAIL(&producers, producer, link);
+
+					AST_RWDLLIST_UNLOCK(&producers);
+				} else {
+					/* This producer has no topics */
+					ao2_ref(producer, -1);
+				}
 			}
 		}
 	}
@@ -712,14 +744,26 @@ static int process_consumer(const struct sorcery_kafka_cluster *sorcery_cluster,
 				struct sorcery_kafka_topic *sorcery_topic;
 
 				while(NULL != (sorcery_topic = ao2_iterator_next(&i))) {
-					process_consumer_topic(consumer, sorcery_topic);
+					if(0 == process_consumer_topic(consumer, sorcery_topic)) {
+						consumer->topic_count++;
+					}
 
 					ao2_ref(sorcery_topic, -1);
 				}
 
 				ao2_iterator_destroy(&i);
 
-				ao2_ref(consumer, -1);
+				if(consumer->topic_count) {
+					AST_RWDLLIST_WRLOCK(&consumers);
+
+					/* Keep object reference count because list reference to it */
+					AST_RWDLLIST_INSERT_TAIL(&consumers, consumer, link);
+
+					AST_RWDLLIST_UNLOCK(&consumers);
+				} else {
+					/* This consumer has no topics */
+					ao2_ref(consumer, -1);
+				}
 			}
 		}
 	}
@@ -742,6 +786,7 @@ static struct kafka_service *new_kafka_producer(const struct sorcery_kafka_clust
 		char *errstr = ast_alloca(KAFKA_ERRSTR_MAX_SIZE);
 
 		producer->timeout_ms = sorcery_producer->timeout_ms;
+		producer->topic_count = 0;
 
 		/* Attempt to creare librdkafka producer */
 		if(NULL == (producer->rd_kafka = rd_kafka_new(RD_KAFKA_PRODUCER, config, errstr, KAFKA_ERRSTR_MAX_SIZE))) {
@@ -782,6 +827,7 @@ static struct kafka_service *new_kafka_consumer(const struct sorcery_kafka_clust
 		char *errstr = ast_alloca(KAFKA_ERRSTR_MAX_SIZE);
 
 		consumer->timeout_ms = sorcery_consumer->timeout_ms;
+		consumer->topic_count = 0;
 
 		/* Attempt to creare librdkafka consumer */
 		if(NULL == (consumer->rd_kafka = rd_kafka_new(RD_KAFKA_CONSUMER, config, errstr, KAFKA_ERRSTR_MAX_SIZE))) {
@@ -853,7 +899,7 @@ static rd_kafka_conf_t *build_rdkafka_cluster_config(const struct sorcery_kafka_
 }
 
 /*! Process Kafka producer related topic at the cluster */
-static void process_producer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic) {
+static int process_producer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic) {
 #if 1
 	RAII_VAR(struct kafka_topic *, topic, new_kafka_producer_topic(producer, sorcery_topic), ao2_cleanup);
 	RAII_VAR(struct ast_kafka_pipe *, pipe, ast_kafka_get_pipe(sorcery_topic->pipe, 1), ao2_cleanup);
@@ -868,9 +914,13 @@ static void process_producer_topic(struct kafka_service *producer, const struct 
 		ao2_ref(topic, +1);
 
 		AST_LIST_UNLOCK(&pipe->producer_topics);
+
+		return 0;
 	} else {
 		ast_log(LOG_ERROR, "Unable to add producer topic '%s' to pipe '%s' - Out of memory\n", 
 			ast_sorcery_object_get_id(sorcery_topic), sorcery_topic->pipe);
+
+		return -1;
 	}
 
 #else
@@ -897,7 +947,7 @@ static void process_producer_topic(struct kafka_service *producer, const struct 
 }
 
 /*! Process Kafka consumer related topic at the cluster */
-static void process_consumer_topic(struct kafka_service *consumer, const struct sorcery_kafka_topic *sorcery_topic) {
+static int process_consumer_topic(struct kafka_service *consumer, const struct sorcery_kafka_topic *sorcery_topic) {
 	RAII_VAR(struct kafka_topic *, topic, new_kafka_consumer_topic(consumer, sorcery_topic), ao2_cleanup);
 	RAII_VAR(struct ast_kafka_pipe *, pipe, ast_kafka_get_pipe(sorcery_topic->pipe, 1), ao2_cleanup);
 
@@ -911,9 +961,13 @@ static void process_consumer_topic(struct kafka_service *consumer, const struct 
 		ao2_ref(topic, +1);
 
 		AST_LIST_UNLOCK(&pipe->consumer_topics);
+
+		return 0;
 	} else {
 		ast_log(LOG_ERROR, "Unable to add consumer topic '%s' to pipe '%s' - Out of memory\n", 
 			ast_sorcery_object_get_id(sorcery_topic), sorcery_topic->pipe);
+
+		return -1;
 	}
 }
 
@@ -958,18 +1012,42 @@ static struct kafka_topic *new_kafka_producer_topic(struct kafka_service *produc
 
 static void kafka_producer_topic_destructor(void *obj) {
 	struct kafka_topic *topic = obj;
+	RAII_VAR(struct kafka_service *, producer, topic->service, ao2_cleanup);
+
+	if(producer) {
+		int last_topic;
+
+		AST_RWDLLIST_WRLOCK(&producers);
+
+		if(! --producer->topic_count) {
+			last_topic = 1;
+
+			/* Remove service from producers list */
+			AST_DLLIST_REMOVE(&producers, producer, link);
+		} else {
+			last_topic = 0;
+		}
+
+		AST_RWDLLIST_UNLOCK(&producers);
+
+		if(last_topic) {
+			/* Wait for messages to be delivered */
+			while(rd_kafka_outq_len(producer->rd_kafka) > 0) {
+				rd_kafka_poll(producer->rd_kafka, producer->timeout_ms);
+			}
+
+			/* No reference to this service */
+			ao2_ref(producer, -1);
+		}
+	}
 
 	if(topic->rd_kafka_topic) {
 		ast_debug(3, "Destroy rd_kafka_topic_t object %p on producer's topic %p\n", topic->rd_kafka_topic, topic);
 		rd_kafka_topic_destroy(topic->rd_kafka_topic);
 	}
-
-	/* Release service object */
-	ao2_cleanup(topic->service);
 }
 
 
-//!!!
 static struct kafka_topic *new_kafka_consumer_topic(struct kafka_service *consumer, const struct sorcery_kafka_topic *sorcery_topic) {
 	struct kafka_topic *topic = ao2_alloc(sizeof(*topic), kafka_consumer_topic_destructor);
 
@@ -1008,20 +1086,101 @@ static struct kafka_topic *new_kafka_consumer_topic(struct kafka_service *consum
 
 static void kafka_consumer_topic_destructor(void *obj) {
 	struct kafka_topic *topic = obj;
+	RAII_VAR(struct kafka_service *, consumer, topic->service, ao2_cleanup);
+
+	if(consumer) {
+		int last_topic;
+
+		AST_RWDLLIST_WRLOCK(&consumers);
+
+		if(! --consumer->topic_count) {
+			last_topic = 1;
+
+			/* Remove service from consumers list */
+			AST_DLLIST_REMOVE(&consumers, consumer, link);
+		} else {
+			last_topic = 0;
+		}
+
+		AST_RWDLLIST_UNLOCK(&consumers);
+
+		if(last_topic) {
+//!!!Предусмотреть остановку приема!
+			/* Wait for messages to be delivered */
+			while(rd_kafka_outq_len(consumer->rd_kafka) > 0) {
+				rd_kafka_poll(consumer->rd_kafka, consumer->timeout_ms);
+			}
+
+			/* No reference to this service */
+			ao2_ref(consumer, -1);
+		}
+	}
 
 	if(topic->rd_kafka_topic) {
 		ast_debug(3, "Destroy rd_kafka_topic_t object %p on consumer's topic %p\n", topic->rd_kafka_topic, topic);
 		rd_kafka_topic_destroy(topic->rd_kafka_topic);
 	}
-
-	/* Release service object */
-	ao2_cleanup(topic->service);
 }
 
-//!!!
 
 
+/*! Execute callback on all producers */
+static int on_all_producers(int (*callback)(struct kafka_service *service, void *opaqe), void *opaqe, int lock, int wrlock) {
+	int status = 0;
+	struct kafka_service *producer;
 
+	if(lock) {
+		if(wrlock) {
+			AST_RWDLLIST_WRLOCK(&producers);
+		} else {
+			AST_RWDLLIST_RDLOCK(&producers);
+		}
+	}
+
+	AST_DLLIST_TRAVERSE(&producers, producer, link) {
+		status |= (*callback)(producer, opaqe);
+
+		if(status < 0) {
+			/* Fatal error */
+			break;
+		}
+	}
+
+	if(lock) {
+		AST_RWDLLIST_UNLOCK(&producers);
+	}
+
+	return status;
+}
+
+/*! Execute callback on all consumers */
+static int on_all_consumers(int (*callback)(struct kafka_service *service, void *opaqe), void *opaqe, int lock, int wrlock) {
+	int status = 0;
+	struct kafka_service *consumer;
+
+	if(lock) {
+		if(wrlock) {
+			AST_RWDLLIST_WRLOCK(&consumers);
+		} else {
+			AST_RWDLLIST_RDLOCK(&consumers);
+		}
+	}
+
+	AST_DLLIST_TRAVERSE(&consumers, consumer, link) {
+		status |= (*callback)(consumer, opaqe);
+
+		if(status < 0) {
+			/* Fatal error */
+			break;
+		}
+	}
+
+	if(lock) {
+		AST_RWDLLIST_UNLOCK(&consumers);
+	}
+
+	return status;
+}
 
 /*! Execute callback on all producer topics in the pipe */
 static int on_all_producer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaqe_1, void *opaqe_2, struct ast_kafka_pipe *pipe), void *opaqe_1, void *opaqe_2) {
@@ -1294,7 +1453,7 @@ static void kafka_pipe_destructor(void *obj) {
 	AST_LIST_LOCK(&pipe->consumer_topics);
 
 	while(NULL != (topic = AST_LIST_REMOVE_HEAD(&pipe->consumer_topics, link))) {
-		/* Release object */
+		/* Release consumer object */
 		ao2_ref(topic, -1);
 	}
 
@@ -1305,7 +1464,7 @@ static void kafka_pipe_destructor(void *obj) {
 	AST_LIST_LOCK(&pipe->producer_topics);
 
 	while(NULL != (topic = AST_LIST_REMOVE_HEAD(&pipe->producer_topics, link))) {
-		/* Release object */
+		/* Release producer object */
 		ao2_ref(topic, -1);
 	}
 
@@ -1324,23 +1483,46 @@ AO2_STRING_FIELD_HASH_FN(ast_kafka_pipe, id)
 AO2_STRING_FIELD_CMP_FN(ast_kafka_pipe, id)
 
 static int load_module(void) {
+	AST_RWDLLIST_HEAD_INIT(&producers);
+	AST_RWDLLIST_HEAD_INIT(&consumers);
+
 	if(NULL == (pipes = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, KAFKA_PIPE_BUCKETS, ast_kafka_pipe_hash_fn, NULL, ast_kafka_pipe_cmp_fn))) {
+		AST_RWDLLIST_HEAD_DESTROY(&producers);
+		AST_RWDLLIST_HEAD_DESTROY(&consumers);
+		return AST_MODULE_LOAD_DECLINE;
+	}
+
+	if(NULL == (kafka_tps = ast_taskprocessor_get(KAFKA_TASKPROCESSOR_MONITOR_ID, TPS_REF_DEFAULT))) {
+		ast_log(LOG_ERROR, "Failed to create Kafka taskprocessor.\n");
+
+		ao2_cleanup(pipes);
+		pipes = NULL;
+		AST_RWDLLIST_HEAD_DESTROY(&producers);
+		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	if(NULL == (kafka_sorcery = ast_sorcery_open())) {
 		ast_log(LOG_ERROR, "Failed to open Kafka sorcery.\n");
 
+		ast_taskprocessor_unreference(kafka_tps);
+		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
+		AST_RWDLLIST_HEAD_DESTROY(&producers);
+		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	if(sorcery_object_register(KAFKA_CLUSTER, sorcery_kafka_cluster_alloc, sorcery_kafka_cluster_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
+		ast_taskprocessor_unreference(kafka_tps);
+		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
+		AST_RWDLLIST_HEAD_DESTROY(&producers);
+		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
@@ -1355,8 +1537,12 @@ static int load_module(void) {
 	if(sorcery_object_register(KAFKA_TOPIC, sorcery_kafka_topic_alloc, sorcery_kafka_topic_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
+		ast_taskprocessor_unreference(kafka_tps);
+		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
+		AST_RWDLLIST_HEAD_DESTROY(&producers);
+		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
@@ -1368,8 +1554,12 @@ static int load_module(void) {
 	if(sorcery_object_register(KAFKA_PRODUCER, sorcery_kafka_producer_alloc, sorcery_kafka_producer_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
+		ast_taskprocessor_unreference(kafka_tps);
+		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
+		AST_RWDLLIST_HEAD_DESTROY(&producers);
+		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
@@ -1382,8 +1572,12 @@ static int load_module(void) {
 		ast_log(LOG_ERROR, "Failed to register observer for '%s' with Kafka sorcery.\n", KAFKA_PRODUCER);
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
+		ast_taskprocessor_unreference(kafka_tps);
+		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
+		AST_RWDLLIST_HEAD_DESTROY(&producers);
+		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
@@ -1392,8 +1586,12 @@ static int load_module(void) {
 	if(sorcery_object_register(KAFKA_CONSUMER, sorcery_kafka_consumer_alloc, sorcery_kafka_consumer_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
+		ast_taskprocessor_unreference(kafka_tps);
+		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
+		AST_RWDLLIST_HEAD_DESTROY(&producers);
+		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
@@ -1406,9 +1604,6 @@ static int load_module(void) {
 
 	/* Process all defined clusters */
 	process_all_clusters();
-
-
-
 
 	ast_cli_register_multiple(kafka_cli, ARRAY_LEN(kafka_cli));
 
@@ -1423,8 +1618,14 @@ static int unload_module(void) {
 	ast_sorcery_unref(kafka_sorcery);
 	kafka_sorcery = NULL;
 
+	ast_taskprocessor_unreference(kafka_tps);
+	kafka_tps = NULL;
+
 	ao2_cleanup(pipes);
 	pipes = NULL;
+
+	AST_RWDLLIST_HEAD_DESTROY(&producers);
+	AST_RWDLLIST_HEAD_DESTROY(&consumers);
 
 	return 0;
 }
