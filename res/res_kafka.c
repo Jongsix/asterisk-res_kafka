@@ -169,8 +169,11 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 #include "asterisk/cli.h"
 #include "asterisk/stringfields.h"
 #include "asterisk/utils.h"
+#include "asterisk/lock.h"
 
 #include "librdkafka/rdkafka.h"
+
+#include <unistd.h>
 
 #define KAFKA_CONFIG_FILENAME "kafka.conf"
 
@@ -179,6 +182,8 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 #define KAFKA_PRODUCER "producer"
 #define KAFKA_CONSUMER "consumer"
 #define KAFKA_ERRSTR_MAX_SIZE 80
+
+#define KAFKA_MONITOR_NO_EVENTS_SLEEP_US 500
 
 #define KAFKA_TASKPROCESSOR_MONITOR_ID "kafka/monitor"
 
@@ -311,6 +316,8 @@ static void kafka_producer_topic_destructor(void *obj);
 static struct kafka_topic *new_kafka_consumer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic);
 static void kafka_consumer_topic_destructor(void *obj);
 
+static int start_monitor_thread(void);
+static void *monitor_thread_job(void *opaqe);
 static int on_all_producers(int (*callback)(struct kafka_service *service, void *opaqe), void *opaqe, int lock, int wrlock);
 static int on_all_consumers(int (*callback)(struct kafka_service *service, void *opaqe), void *opaqe, int lock, int wrlock);
 
@@ -346,6 +353,12 @@ static const struct ast_sorcery_observer producer_observers = {
 	.deleted = on_producer_deleted,
 	.loaded = on_producer_loaded,
 };
+
+/*! Protect access to the monitor variable */
+AST_MUTEX_DEFINE_STATIC(monitor_lock);
+
+/*! Module's monitor thread */
+static pthread_t monitor;
 
 /*! Module's taskprocessor */
 static struct ast_taskprocessor *kafka_tps;
@@ -712,6 +725,11 @@ static int process_producer(const struct sorcery_kafka_cluster *sorcery_cluster,
 					AST_RWDLLIST_INSERT_TAIL(&producers, producer, link);
 
 					AST_RWDLLIST_UNLOCK(&producers);
+
+					/* Assert monitor thread is running */
+					if(start_monitor_thread()) {
+						ast_log(LOG_WARNING, "Unable to start monitoring thread.\n");
+					}
 				} else {
 					/* This producer has no topics */
 					ao2_ref(producer, -1);
@@ -760,6 +778,11 @@ static int process_consumer(const struct sorcery_kafka_cluster *sorcery_cluster,
 					AST_RWDLLIST_INSERT_TAIL(&consumers, consumer, link);
 
 					AST_RWDLLIST_UNLOCK(&consumers);
+
+					/* Assert monitor thread is running */
+					if(start_monitor_thread()) {
+						ast_log(LOG_WARNING, "Unable to start monitoring thread.\n");
+					}
 				} else {
 					/* This consumer has no topics */
 					ao2_ref(consumer, -1);
@@ -1123,6 +1146,73 @@ static void kafka_consumer_topic_destructor(void *obj) {
 }
 
 
+/*! Start monitor thread if possible */
+static int start_monitor_thread(void) {
+	int res = 0;
+
+	ast_mutex_lock(&monitor_lock);
+
+	if(AST_PTHREADT_NULL == monitor) {
+		res = ast_pthread_create_detached_background(&monitor, NULL, monitor_thread_job, NULL);
+	}
+
+	ast_mutex_unlock(&monitor_lock);
+
+	return res;
+}
+
+/*! Monitoring thread job */
+static void *monitor_thread_job(void *opaqe) {
+	int active;
+
+	ast_debug(3, "Monitor thread started.\n");
+
+	do {
+		int processed = 0;
+		struct kafka_service *service;
+
+		active = 0;
+
+		/* Process producer services*/
+		AST_RWDLLIST_RDLOCK(&producers);
+		AST_DLLIST_TRAVERSE(&producers, service, link) {
+			active++;
+
+			/* Process producer events */
+			processed += rd_kafka_poll(service->rd_kafka, 0);
+		}
+		AST_RWDLLIST_UNLOCK(&producers);
+
+
+		AST_RWDLLIST_RDLOCK(&consumers);
+		AST_DLLIST_TRAVERSE(&consumers, service, link) {
+			active++;
+
+			/* Process consumer events */
+			processed += rd_kafka_poll(service->rd_kafka, 0);
+		}
+		AST_RWDLLIST_UNLOCK(&consumers);
+
+		if(active && !processed) {
+			/* Some services exist, but no pending events yet */
+			usleep(KAFKA_MONITOR_NO_EVENTS_SLEEP_US);
+		}
+	} while(active);
+
+	ast_mutex_lock(&monitor_lock);
+
+	if((AST_PTHREADT_NULL != monitor) && (AST_PTHREADT_STOP != monitor)) {
+		/* Normal thread shudtown */
+		monitor = AST_PTHREADT_NULL;
+	}
+
+	ast_mutex_unlock(&monitor_lock);
+
+	ast_debug(3, "Monitor thread finished.\n");
+
+	return NULL;
+}
+
 
 /*! Execute callback on all producers */
 static int on_all_producers(int (*callback)(struct kafka_service *service, void *opaqe), void *opaqe, int lock, int wrlock) {
@@ -1483,6 +1573,9 @@ AO2_STRING_FIELD_HASH_FN(ast_kafka_pipe, id)
 AO2_STRING_FIELD_CMP_FN(ast_kafka_pipe, id)
 
 static int load_module(void) {
+	/* Monitor thread not started yet */
+	monitor = AST_PTHREADT_NULL;
+
 	AST_RWDLLIST_HEAD_INIT(&producers);
 	AST_RWDLLIST_HEAD_INIT(&consumers);
 
@@ -1611,6 +1704,30 @@ static int load_module(void) {
 }
 
 static int unload_module(void) {
+	pthread_t active_monitor;
+
+	/* When we remove pipes, it destroy all linked services */
+	ao2_cleanup(pipes);
+	pipes = NULL;
+
+	ast_mutex_lock(&monitor_lock);
+
+	active_monitor = monitor;
+
+	/* Prevent monitor activation */
+	monitor = AST_PTHREADT_STOP;
+
+	ast_mutex_unlock(&monitor_lock);
+
+	if((AST_PTHREADT_NULL != active_monitor) && (AST_PTHREADT_STOP != active_monitor)) {
+		/* Need to stop monitor thread */
+#if 0
+		pthread_cancel(active_monitor);
+		pthread_kill(active_monitor, SIGURG);
+#endif
+		pthread_join(active_monitor, NULL);
+	}
+
 	ast_sorcery_observer_remove(kafka_sorcery, KAFKA_PRODUCER, &producer_observers);
 
 	ast_cli_unregister_multiple(kafka_cli, ARRAY_LEN(kafka_cli));
@@ -1620,9 +1737,6 @@ static int unload_module(void) {
 
 	ast_taskprocessor_unreference(kafka_tps);
 	kafka_tps = NULL;
-
-	ao2_cleanup(pipes);
-	pipes = NULL;
 
 	AST_RWDLLIST_HEAD_DESTROY(&producers);
 	AST_RWDLLIST_HEAD_DESTROY(&consumers);
