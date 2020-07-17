@@ -180,7 +180,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #include "asterisk/module.h"
 #include "asterisk/sorcery.h"
-#include "asterisk/taskprocessor.h"
+//#include "asterisk/taskprocessor.h"
 #include "asterisk/astobj2.h"
 #include "asterisk/linkedlists.h"
 #include "asterisk/dlinkedlists.h"
@@ -203,7 +203,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 
 #define KAFKA_MONITOR_NO_EVENTS_SLEEP_US 500
 
-#define KAFKA_TASKPROCESSOR_MONITOR_ID "kafka/monitor"
+//#define KAFKA_TASKPROCESSOR_MONITOR_ID "kafka/monitor"
 
 /*! Buckets for pipe hash. Keep it prime! */
 #define KAFKA_PIPE_BUCKETS 127
@@ -424,7 +424,7 @@ AST_MUTEX_DEFINE_STATIC(monitor_lock);
 static pthread_t monitor;
 
 /*! Module's taskprocessor */
-static struct ast_taskprocessor *kafka_tps;
+//static struct ast_taskprocessor *kafka_tps;
 
 /*! List of active producers */
 static AST_RWLIST_HEAD(kafka_producers_head_t, kafka_service) producers;
@@ -1854,21 +1854,21 @@ static int load_module(void) {
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
-	if(NULL == (kafka_tps = ast_taskprocessor_get(KAFKA_TASKPROCESSOR_MONITOR_ID, TPS_REF_DEFAULT))) {
-		ast_log(LOG_ERROR, "Failed to create Kafka taskprocessor.\n");
-
-		ao2_cleanup(pipes);
-		pipes = NULL;
-		AST_RWDLLIST_HEAD_DESTROY(&producers);
-		AST_RWDLLIST_HEAD_DESTROY(&consumers);
-		return AST_MODULE_LOAD_DECLINE;
-	}
+//	if(NULL == (kafka_tps = ast_taskprocessor_get(KAFKA_TASKPROCESSOR_MONITOR_ID, TPS_REF_DEFAULT))) {
+//		ast_log(LOG_ERROR, "Failed to create Kafka taskprocessor.\n");
+//
+//		ao2_cleanup(pipes);
+//		pipes = NULL;
+//		AST_RWDLLIST_HEAD_DESTROY(&producers);
+//		AST_RWDLLIST_HEAD_DESTROY(&consumers);
+//		return AST_MODULE_LOAD_DECLINE;
+//	}
 
 	if(NULL == (kafka_sorcery = ast_sorcery_open())) {
 		ast_log(LOG_ERROR, "Failed to open Kafka sorcery.\n");
 
-		ast_taskprocessor_unreference(kafka_tps);
-		kafka_tps = NULL;
+//		ast_taskprocessor_unreference(kafka_tps);
+//		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
@@ -1879,8 +1879,8 @@ static int load_module(void) {
 	if(sorcery_object_register(KAFKA_CLUSTER, sorcery_kafka_cluster_alloc, sorcery_kafka_cluster_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
-		ast_taskprocessor_unreference(kafka_tps);
-		kafka_tps = NULL;
+//		ast_taskprocessor_unreference(kafka_tps);
+//		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
@@ -1898,8 +1898,8 @@ static int load_module(void) {
 	if(sorcery_object_register(KAFKA_TOPIC, sorcery_kafka_topic_alloc, sorcery_kafka_topic_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
-		ast_taskprocessor_unreference(kafka_tps);
-		kafka_tps = NULL;
+//		ast_taskprocessor_unreference(kafka_tps);
+//		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
@@ -1915,8 +1915,8 @@ static int load_module(void) {
 	if(sorcery_object_register(KAFKA_PRODUCER, sorcery_kafka_producer_alloc, sorcery_kafka_producer_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
-		ast_taskprocessor_unreference(kafka_tps);
-		kafka_tps = NULL;
+//		ast_taskprocessor_unreference(kafka_tps);
+//		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
@@ -1935,8 +1935,8 @@ static int load_module(void) {
 		ast_log(LOG_ERROR, "Failed to register observer for '%s' with Kafka sorcery.\n", KAFKA_PRODUCER);
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
-		ast_taskprocessor_unreference(kafka_tps);
-		kafka_tps = NULL;
+//		ast_taskprocessor_unreference(kafka_tps);
+//		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
@@ -1949,8 +1949,8 @@ static int load_module(void) {
 	if(sorcery_object_register(KAFKA_CONSUMER, sorcery_kafka_consumer_alloc, sorcery_kafka_consumer_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
 		kafka_sorcery = NULL;
-		ast_taskprocessor_unreference(kafka_tps);
-		kafka_tps = NULL;
+//		ast_taskprocessor_unreference(kafka_tps);
+//		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
@@ -2010,8 +2010,8 @@ static int unload_module(void) {
 	ast_sorcery_unref(kafka_sorcery);
 	kafka_sorcery = NULL;
 
-	ast_taskprocessor_unreference(kafka_tps);
-	kafka_tps = NULL;
+//	ast_taskprocessor_unreference(kafka_tps);
+//	kafka_tps = NULL;
 
 	AST_RWDLLIST_HEAD_DESTROY(&producers);
 	AST_RWDLLIST_HEAD_DESTROY(&consumers);
