@@ -23,6 +23,7 @@
 
 struct ast_kafka_pipe;
 
+int ast_kafka_send_message(struct ast_kafka_pipe *pipe, const void *payload, size_t payload_size);
 struct ast_kafka_pipe *ast_kafka_get_pipe(const char *pipe_id, int force);
 
 #endif /* _ASTERISK_RES_KAFKA_H */
