@@ -112,6 +112,30 @@
 				<configOption name="partition" default="-1">
 					<synopsis>Producer's partition, less than zero if unassigned (default)</synopsis>
 				</configOption>
+				<configOption name="request_required_acks" default="-1">
+					<synopsis>request.required.acks (default -1)</synopsis>
+				</configOption>
+				<configOption name="max_in_flight_requests_per_connection" default="1000000">
+					<synopsis>max.in.flight.requests.per.connection (default 1000000)</synopsis>
+				</configOption>
+				<configOption name="message_send_max_retries" default="2">
+					<synopsis>message.send.max.retries (default 2)</synopsis>
+				</configOption>
+				<configOption name="enable_idempotence" default="no">
+					<synopsis>enable.idempotence (default no)</synopsis>
+					<description>
+						<enumlist>
+							<enum name="no" />
+							<enum name="yes" />
+						</enumlist>
+					</description>
+				</configOption>
+				<configOption name="transactional_id">
+					<synopsis>transactional.id (default none)</synopsis>
+				</configOption>
+				<configOption name="client_id" default="asterisk">
+					<synopsis>Client id (default 'asterisk')</synopsis>
+				</configOption>
 				<configOption name="debug">
 					<synopsis>Comma-separated list of debug contexts to enable</synopsis>
 				</configOption>
@@ -144,6 +168,18 @@
 				</configOption>
 				<configOption name="auto_commit_interval" default="5000">
 					<synopsis>Interval when consumer commited offset, ms. Default 5000ms.</synopsis>
+				</configOption>
+				<configOption name="isolation_level" default="read_committed">
+					<synopsis>isolation.level (default 'read_committed')</synopsis>
+					<description>
+						<enumlist>
+							<enum name="read_committed" />
+							<enum name="read_uncommitted" />
+						</enumlist>
+					</description>
+				</configOption>
+				<configOption name="client_id" default="asterisk">
+					<synopsis>Client id (default 'asterisk')</synopsis>
 				</configOption>
 				<configOption name="debug">
 					<synopsis>Comma-separated list of debug contexts to enable</synopsis>
@@ -233,6 +269,10 @@ struct sorcery_kafka_producer {
 	AST_DECLARE_STRING_FIELDS(
 		/*! Cluster resource id */
 		AST_STRING_FIELD(cluster_id);
+		/*! Client identifier */
+		AST_STRING_FIELD(client_id);
+		/*! transactional.id */
+		AST_STRING_FIELD(transactional_id);
 		/*! Comma separated contexts for debug */
 		AST_STRING_FIELD(debug);
 	);
@@ -240,6 +280,14 @@ struct sorcery_kafka_producer {
 	unsigned int timeout_ms;
 	/*! Producer's partition, less than zero mean is unassigned */
 	int partition;
+	/*! request.required.acks */
+	int request_required_acks;
+	/*! max.in.flight.requests.per.connection */
+	unsigned int max_in_flight_requests_per_connection;
+	/*! message.send.max.retries */
+	unsigned int message_send_max_retries;
+	/*! enable.idempotence */
+	unsigned int enable_idempotence;
 };
 
 /*! Kafka consumer common parameters */
@@ -248,8 +296,12 @@ struct sorcery_kafka_consumer {
 	AST_DECLARE_STRING_FIELDS(
 		/*! Cluster resource id */
 		AST_STRING_FIELD(cluster_id);
+		/*! Client identifier */
+		AST_STRING_FIELD(client_id);
 		/*! Client group id */
 		AST_STRING_FIELD(group_id);
+		/*! isolation.level */
+		AST_STRING_FIELD(isolation_level);
 		/*! Comma separated contexts for debug */
 		AST_STRING_FIELD(debug);
 	);
@@ -1927,6 +1979,12 @@ static int load_module(void) {
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "cluster", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, cluster_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "timeout", "10000", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_producer, timeout_ms));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "partition", "-1", OPT_INT_T, 0, FLDSET(struct sorcery_kafka_producer, partition));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "request_required_acks", "-1", OPT_INT_T, 0, FLDSET(struct sorcery_kafka_producer, request_required_acks));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "max_in_flight_requests_per_connection", "1000000", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_producer, max_in_flight_requests_per_connection));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "message_send_max_retries", "2", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_producer, message_send_max_retries));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "enable_idempotence", "no", OPT_BOOL_T, 1, FLDSET(struct sorcery_kafka_producer, enable_idempotence));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "transactional_id", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, transactional_id));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "client_id", "asterisk", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, client_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "debug", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, debug));
 
 
@@ -1960,10 +2018,12 @@ static int load_module(void) {
 
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "cluster", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, cluster_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "group_id", "asterisk", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, group_id));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "isolation_level", "read_committed", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, isolation_level));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "timeout", "10000", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_consumer, timeout_ms));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "partition", "-1", OPT_INT_T, 0, FLDSET(struct sorcery_kafka_consumer, partition));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "enable_auto_commit", "yes", OPT_BOOL_T, 1, FLDSET(struct sorcery_kafka_consumer, enable_auto_commit));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "auto_commit_interval", "5000", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_consumer, auto_commit_interval_ms));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "client_id", "asterisk", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, client_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "debug", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, debug));
 
 
