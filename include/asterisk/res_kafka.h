@@ -23,7 +23,26 @@
 
 struct ast_kafka_pipe;
 
-int ast_kafka_send_message(struct ast_kafka_pipe *pipe, const void *payload, size_t payload_size);
+/*!
+ * \brief Send message to the specified pipe.
+ * 
+ * \details
+ * Send message to the specified pipe.
+ * 
+ * \note
+ * 
+ * \param pipe
+ * \param key - Kafka message key, can be NULL
+ * \param payoad
+ * \param payload_size
+ * 
+ * \return
+ */
+int ast_kafka_send_message(struct ast_kafka_pipe *pipe, const char *key, 
+				const void *payload, size_t payload_size);
+/*!
+ * 
+ */
 struct ast_kafka_pipe *ast_kafka_get_pipe(const char *pipe_id, int force);
 
 #endif /* _ASTERISK_RES_KAFKA_H */

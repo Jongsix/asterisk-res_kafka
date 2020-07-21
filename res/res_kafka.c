@@ -97,7 +97,17 @@
 				<configOption name="client_id" default="asterisk">
 					<synopsis>Client id for this connection</synopsis>
 				</configOption>
+				<configOption name="retry_backoff_ms" default="100">
+					<synopsis>The backoff time in milliseconds before retrying a protocol request.</synopsis>
+					<description><para>
+						The backoff time in milliseconds before retrying a protocol request.
+						</para>
+						<para>Kafka property: retry.backoff.ms</para>
+						<para>Default value: 100</para>
+					</description>
+*				</configOption>
 			</configObject>
+ 
 			<configObject name="producer">
 				<synopsis>Kafka producer description</synopsis>
 				<configOption name="type">
@@ -140,6 +150,7 @@
 					<synopsis>Comma-separated list of debug contexts to enable</synopsis>
 				</configOption>
 			</configObject>
+
 			<configObject name="consumer">
 				<synopsis>Kafka consumer description</synopsis>
 				<configOption name="type">
@@ -185,6 +196,7 @@
 					<synopsis>Comma-separated list of debug contexts to enable</synopsis>
 				</configOption>
 			</configObject>
+
 			<configObject name="topic">
 				<synopsis>Kafka topic description</synopsis>
 				<configOption name="type">
@@ -261,6 +273,8 @@ struct sorcery_kafka_cluster {
 		/*! Client identifier */
 		AST_STRING_FIELD(client_id);
 	);
+	/*! The backoff time in milliseconds before retrying a protocol request. */
+	unsigned int retry_backoff_ms;
 };
 
 /*! Kafka producer common parameters */
@@ -390,6 +404,7 @@ struct ast_kafka_pipe {
 	AST_LIST_HEAD(/*consumer_topics_s*/, kafka_topic) consumer_topics;
 };
 
+/*! Fowrdwd local functions declaration */
 
 static int send_message(struct kafka_topic *topic, void *opaque_1, void *opaque_2, struct ast_kafka_pipe *pipe);
 
@@ -492,7 +507,8 @@ static struct ao2_container *pipes;
 
 
 /*! Module API: Send message to the pipe */
-int ast_kafka_send_message(struct ast_kafka_pipe *pipe, const void *payload, size_t payload_size) {
+int ast_kafka_send_message(struct ast_kafka_pipe *pipe, const char *key, 
+				const void *payload, size_t payload_size) {
 	return on_all_producer_topics(pipe, send_message, (void*)payload, &payload_size);
 }
 
@@ -508,7 +524,12 @@ static int send_message(struct kafka_topic *topic, void *opaque_1, void *opaque_
 				pipe->id, pipe, topic->rd_kafka_topic, topic->service->partition, payload, payload_size);
 	}
 
-	return rd_kafka_produce(topic->rd_kafka_topic, topic->service->partition/*RD_KAFKA_PARTITION_UA*/, RD_KAFKA_MSG_F_COPY, payload, payload_size, NULL, 0, NULL);
+	return rd_kafka_produce(topic->rd_kafka_topic, 
+				topic->service->partition, 
+				RD_KAFKA_MSG_F_COPY, 
+				payload, payload_size,	/* payload and payload size*/
+				NULL, 0,		/* key and key size */
+				NULL);
 }
 
 /*! Module API: Get existing pipe or create new if not present */
@@ -584,7 +605,7 @@ static char *handle_kafka_loopback(struct ast_cli_entry *e, int cmd, struct ast_
 			if(NULL == pipe) {
 				ast_cli(a->fd, "Pipe '%s' not found\n", a->argv[3]);
 			} else {
-				int res = ast_kafka_send_message(pipe, "PING LOOPBACK", 13);
+				int res = ast_kafka_send_message(pipe, NULL, "PING LOOPBACK", 13);
 
 				ast_cli(a->fd, "Execute %s on pipe %s with code %d\n", a->argv[4], a->argv[3], res);
 			}
@@ -1125,6 +1146,7 @@ static void kafka_consumer_destructor(void *obj) {
 static rd_kafka_conf_t *build_rdkafka_cluster_config(const struct sorcery_kafka_cluster *cluster) {
 	rd_kafka_conf_t *config = rd_kafka_conf_new();
 	char *errstr = ast_alloca(KAFKA_ERRSTR_MAX_SIZE);
+	char *tmp = ast_alloca(32);
 
 	if(NULL == config) {
 		ast_log(LOG_ERROR, "Kafka cluster %s: unable to create configuration object\n", ast_sorcery_object_get_id(cluster));
@@ -1161,6 +1183,13 @@ static rd_kafka_conf_t *build_rdkafka_cluster_config(const struct sorcery_kafka_
 		return NULL;
 	}
 
+	sprintf(tmp, "%u", cluster->retry_backoff_ms);
+	if(RD_KAFKA_CONF_OK != rd_kafka_conf_set(config, "retry.backoff.ms", tmp, errstr, KAFKA_ERRSTR_MAX_SIZE)) {
+		ast_log(LOG_ERROR, "Kafka cluster %s: unable to set retry.backoff.ms property because %s\n", ast_sorcery_object_get_id(cluster), errstr);
+		rd_kafka_conf_destroy(config);
+		return NULL;
+	}
+	
 	return config;
 }
 
@@ -1946,6 +1975,7 @@ static int load_module(void) {
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CLUSTER, "sasl_username", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_cluster, sasl_username));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CLUSTER, "sasl_password", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_cluster, sasl_password));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CLUSTER, "client_id", "asterisk", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_cluster, client_id));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CLUSTER, "retry_backoff_ms", "100", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_cluster, retry_backoff_ms));
 
 	if(sorcery_object_register(KAFKA_TOPIC, sorcery_kafka_topic_alloc, sorcery_kafka_topic_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
