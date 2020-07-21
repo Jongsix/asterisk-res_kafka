@@ -97,15 +97,6 @@
 				<configOption name="client_id" default="asterisk">
 					<synopsis>Client id for this connection</synopsis>
 				</configOption>
-				<configOption name="retry_backoff_ms" default="100">
-					<synopsis>The backoff time in milliseconds before retrying a protocol request.</synopsis>
-					<description><para>
-						The backoff time in milliseconds before retrying a protocol request.
-						</para>
-						<para>Kafka property: retry.backoff.ms</para>
-						<para>Default value: 100</para>
-					</description>
-*				</configOption>
 			</configObject>
  
 			<configObject name="producer">
@@ -143,8 +134,17 @@
 				<configOption name="transactional_id">
 					<synopsis>transactional.id (default none)</synopsis>
 				</configOption>
-				<configOption name="client_id" default="asterisk">
-					<synopsis>Client id (default 'asterisk')</synopsis>
+				<configOption name="retry_backoff_ms" default="100">
+					<synopsis>The backoff time in milliseconds before retrying a protocol request.</synopsis>
+					<description><para>
+						The backoff time in milliseconds before retrying a protocol request.
+						</para>
+						<para>Kafka property: retry.backoff.ms</para>
+						<para>Default value: 100</para>
+					</description>
+				</configOption>
+				<configOption name="client_id">
+					<synopsis>Client id (default from cluster configuration)</synopsis>
 				</configOption>
 				<configOption name="debug">
 					<synopsis>Comma-separated list of debug contexts to enable</synopsis>
@@ -189,8 +189,8 @@
 						</enumlist>
 					</description>
 				</configOption>
-				<configOption name="client_id" default="asterisk">
-					<synopsis>Client id (default 'asterisk')</synopsis>
+				<configOption name="client_id">
+					<synopsis>Client id (default from cluster configuration)</synopsis>
 				</configOption>
 				<configOption name="debug">
 					<synopsis>Comma-separated list of debug contexts to enable</synopsis>
@@ -248,6 +248,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 #define KAFKA_PRODUCER "producer"
 #define KAFKA_CONSUMER "consumer"
 #define KAFKA_ERRSTR_MAX_SIZE 80
+#define TMP_BUF_SIZE 32
 
 #define KAFKA_MONITOR_NO_EVENTS_SLEEP_US 500
 
@@ -273,8 +274,6 @@ struct sorcery_kafka_cluster {
 		/*! Client identifier */
 		AST_STRING_FIELD(client_id);
 	);
-	/*! The backoff time in milliseconds before retrying a protocol request. */
-	unsigned int retry_backoff_ms;
 };
 
 /*! Kafka producer common parameters */
@@ -302,6 +301,8 @@ struct sorcery_kafka_producer {
 	unsigned int message_send_max_retries;
 	/*! enable.idempotence */
 	unsigned int enable_idempotence;
+	/*! The backoff time in milliseconds before retrying a protocol request. */
+	unsigned int retry_backoff_ms;
 };
 
 /*! Kafka consumer common parameters */
@@ -432,6 +433,22 @@ static struct kafka_service *new_kafka_consumer(const struct sorcery_kafka_clust
 static void kafka_consumer_destructor(void *obj);
 
 static rd_kafka_conf_t *build_rdkafka_cluster_config(const struct sorcery_kafka_cluster *cluster);
+static int service_add_property_int(rd_kafka_conf_t *config, 
+					const char *property, int value, 
+					const char *service_type,
+					const char *service_id,
+					const char *cluster_id);
+static int service_add_property_uint(rd_kafka_conf_t *config, 
+					const char *property, unsigned value, 
+					const char *service_type,
+					const char *service_id,
+					const char *cluster_id);
+static int service_add_property_string(rd_kafka_conf_t *config, 
+					const char *property, const char *value,
+					const char *service_type,
+					const char *service_id,
+					const char *cluster_id);
+
 
 static int process_producer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic);
 static int process_consumer_topic(struct kafka_service *consumer, const struct sorcery_kafka_topic *sorcery_topic);
@@ -973,16 +990,49 @@ static struct kafka_service *new_kafka_producer(const struct sorcery_kafka_clust
 		return NULL;
 	} else {
 		/* Set producer-specific configuration options */
-		char *errstr = ast_alloca(KAFKA_ERRSTR_MAX_SIZE);
-
-		if(strlen(sorcery_producer->debug)) {
-			if(RD_KAFKA_CONF_OK != rd_kafka_conf_set(config, "debug", sorcery_producer->debug, errstr, KAFKA_ERRSTR_MAX_SIZE)) {
-				ast_log(LOG_ERROR, "Kafka producer '%s' for cluster '%s': unable to set debug options because %s\n", 
-					ast_sorcery_object_get_id(sorcery_producer), ast_sorcery_object_get_id(sorcery_cluster), errstr);
-				rd_kafka_conf_destroy(config);
-				return NULL;
-			}
+		static const char *service_type = "producer";
+		const char *service_id = ast_sorcery_object_get_id(sorcery_producer);
+		const char *cluster_id = ast_sorcery_object_get_id(sorcery_cluster);
+		
+		if(service_add_property_uint(config, "retry.backoff.ms", sorcery_producer->retry_backoff_ms, service_type, service_id, cluster_id)) {
+			rd_kafka_conf_destroy(config);
+			return NULL;
 		}
+
+		if(service_add_property_int(config, "request.required.acks", sorcery_producer->request_required_acks, service_type, service_id, cluster_id)) {
+			rd_kafka_conf_destroy(config);
+			return NULL;
+		}
+		
+		if(service_add_property_uint(config, "message.send.max.retries", sorcery_producer->message_send_max_retries, service_type, service_id, cluster_id)) {
+			rd_kafka_conf_destroy(config);
+			return NULL;
+		}
+
+		if(service_add_property_uint(config, "max.in.flight.requests.per.connection", sorcery_producer->max_in_flight_requests_per_connection, service_type, service_id, cluster_id)) {
+			rd_kafka_conf_destroy(config);
+			return NULL;
+		}
+
+		if(service_add_property_string(config, "enable.idempotence", sorcery_producer->enable_idempotence ? "true" : "false", service_type, service_id, cluster_id)) {
+			/* On current version librdkafka idempotence producers not supported yet */
+			ast_log(LOG_WARNING, "Current version librdkafka (%s) not support dempotence producers.\n", rd_kafka_version_str());
+		}
+		
+		if(service_add_property_string(config, "transactional.id", sorcery_producer->transactional_id, service_type, service_id, cluster_id)) {
+			rd_kafka_conf_destroy(config);
+			return NULL;
+		}
+
+		if(service_add_property_string(config, "client.id", S_OR(sorcery_producer->client_id, sorcery_cluster->client_id), service_type, service_id, cluster_id)) {
+			rd_kafka_conf_destroy(config);
+			return NULL;
+		}		
+		
+		if(service_add_property_string(config, "debug", sorcery_producer->debug, service_type, service_id, cluster_id)) {
+			rd_kafka_conf_destroy(config);
+			return NULL;
+		}		
 	}
 
 	if(NULL == (producer = ao2_alloc(sizeof(*producer), kafka_producer_destructor))) {
@@ -1037,47 +1087,40 @@ static struct kafka_service *new_kafka_consumer(const struct sorcery_kafka_clust
 		return NULL;
 	} else {
 		/* Set consumer-specific configuration options */
-		char *errstr = ast_alloca(KAFKA_ERRSTR_MAX_SIZE);
-		char *tmp = ast_alloca(32);
+		static const char *service_type = "producer";
+		const char *service_id = ast_sorcery_object_get_id(sorcery_consumer);
+		const char *cluster_id = ast_sorcery_object_get_id(sorcery_cluster);
 
-		if(strlen(sorcery_consumer->debug)) {
-			if(RD_KAFKA_CONF_OK != rd_kafka_conf_set(config, "debug", sorcery_consumer->debug, errstr, KAFKA_ERRSTR_MAX_SIZE)) {
-				ast_log(LOG_ERROR, "Kafka consumer '%s' for cluster '%s': unable to set debug options because %s\n", 
-					ast_sorcery_object_get_id(sorcery_consumer), ast_sorcery_object_get_id(sorcery_cluster), errstr);
-				rd_kafka_conf_destroy(config);
-				return NULL;
-			}
-		}
-
-		if(RD_KAFKA_CONF_OK != rd_kafka_conf_set(config, "group.id", sorcery_consumer->group_id, errstr, KAFKA_ERRSTR_MAX_SIZE)) {
-			ast_log(LOG_ERROR, "Kafka consumer '%s' for cluster '%s': unable to set group.id options because %s\n", 
-				ast_sorcery_object_get_id(sorcery_consumer), ast_sorcery_object_get_id(sorcery_cluster), errstr);
+		if(service_add_property_string(config, "group.id", sorcery_consumer->group_id, service_type, service_id, cluster_id)) {
 			rd_kafka_conf_destroy(config);
 			return NULL;
-		}
+		}		
 
-		if(RD_KAFKA_CONF_OK != rd_kafka_conf_set(config, "enable.auto.commit", sorcery_consumer->enable_auto_commit ? "true" : "false", errstr, KAFKA_ERRSTR_MAX_SIZE)) {
-			ast_log(LOG_ERROR, "Kafka consumer '%s' for cluster '%s': unable to set enable.auto.commit options because %s\n", 
-				ast_sorcery_object_get_id(sorcery_consumer), ast_sorcery_object_get_id(sorcery_cluster), errstr);
+		if(service_add_property_string(config, "enable.auto.commit", sorcery_consumer->enable_auto_commit ? "true" : "false", service_type, service_id, cluster_id)) {
 			rd_kafka_conf_destroy(config);
 			return NULL;
-		}
+		}		
 
-		sprintf(tmp, "%u", sorcery_consumer->auto_commit_interval_ms);
-		if(RD_KAFKA_CONF_OK != rd_kafka_conf_set(config, "auto.commit.interval.ms", tmp, errstr, KAFKA_ERRSTR_MAX_SIZE)) {
-			ast_log(LOG_ERROR, "Kafka consumer '%s' for cluster '%s': unable to set auto.commit.interval.ms options because %s\n", 
-				ast_sorcery_object_get_id(sorcery_consumer), ast_sorcery_object_get_id(sorcery_cluster), errstr);
+		if(service_add_property_uint(config, "auto.commit.interval.ms", sorcery_consumer->auto_commit_interval_ms, service_type, service_id, cluster_id)) {
 			rd_kafka_conf_destroy(config);
 			return NULL;
-		}
+		}		
 
 		/* Emit RD_KAFKA_RESP_ERR__PARTITION_EOF event whenever the consumer reaches the end of a partition. */
-		if(RD_KAFKA_CONF_OK != rd_kafka_conf_set(config, "enable.partition.eof", "true", errstr, KAFKA_ERRSTR_MAX_SIZE)) {
-			ast_log(LOG_ERROR, "Kafka consumer '%s' for cluster '%s': unable to set consumer-specific options because %s\n", 
-				ast_sorcery_object_get_id(sorcery_consumer), ast_sorcery_object_get_id(sorcery_cluster), errstr);
+		if(service_add_property_string(config, "enable.partition.eof", "true", service_type, service_id, cluster_id)) {
 			rd_kafka_conf_destroy(config);
 			return NULL;
-		}
+		}		
+		
+		if(service_add_property_string(config, "client.id", S_OR(sorcery_consumer->client_id, sorcery_cluster->client_id), service_type, service_id, cluster_id)) {
+			rd_kafka_conf_destroy(config);
+			return NULL;
+		}		
+		
+		if(service_add_property_string(config, "debug", sorcery_consumer->debug, service_type, service_id, cluster_id)) {
+			rd_kafka_conf_destroy(config);
+			return NULL;
+		}		
 	}
 
 	if(NULL == (consumer = ao2_alloc(sizeof(*consumer), kafka_consumer_destructor))) {
@@ -1146,7 +1189,6 @@ static void kafka_consumer_destructor(void *obj) {
 static rd_kafka_conf_t *build_rdkafka_cluster_config(const struct sorcery_kafka_cluster *cluster) {
 	rd_kafka_conf_t *config = rd_kafka_conf_new();
 	char *errstr = ast_alloca(KAFKA_ERRSTR_MAX_SIZE);
-	char *tmp = ast_alloca(32);
 
 	if(NULL == config) {
 		ast_log(LOG_ERROR, "Kafka cluster %s: unable to create configuration object\n", ast_sorcery_object_get_id(cluster));
@@ -1183,14 +1225,55 @@ static rd_kafka_conf_t *build_rdkafka_cluster_config(const struct sorcery_kafka_
 		return NULL;
 	}
 
-	sprintf(tmp, "%u", cluster->retry_backoff_ms);
-	if(RD_KAFKA_CONF_OK != rd_kafka_conf_set(config, "retry.backoff.ms", tmp, errstr, KAFKA_ERRSTR_MAX_SIZE)) {
-		ast_log(LOG_ERROR, "Kafka cluster %s: unable to set retry.backoff.ms property because %s\n", ast_sorcery_object_get_id(cluster), errstr);
-		rd_kafka_conf_destroy(config);
-		return NULL;
-	}
-	
 	return config;
+}
+
+/*! Add signed integer property value to the Kafka configuration */
+static int service_add_property_int(rd_kafka_conf_t *config, 
+					const char *property, int value, 
+					const char *service_type,
+					const char *service_id,
+					const char *cluster_id) {
+	char *tmp = ast_alloca(TMP_BUF_SIZE);
+	
+	snprintf(tmp, TMP_BUF_SIZE, "%d", value);
+
+	return service_add_property_string(config, property, tmp, service_type, service_id, cluster_id);
+}
+
+/*! Add unsigned integer property value to the Kafka configuration */
+static int service_add_property_uint(rd_kafka_conf_t *config, 
+					const char *property, unsigned value, 
+					const char *service_type,
+					const char *service_id,
+					const char *cluster_id) {
+	char *tmp = ast_alloca(TMP_BUF_SIZE);
+	
+	snprintf(tmp, TMP_BUF_SIZE, "%u", value);
+
+	return service_add_property_string(config, property, tmp, service_type, service_id, cluster_id);
+}
+
+/*! Add string property value to the Kafka configuration */
+static int service_add_property_string(rd_kafka_conf_t *config, 
+					const char *property, const char *value,
+					const char *service_type,
+					const char *service_id,
+					const char *cluster_id) {
+	if(value && strlen(value)) {
+		char *errstr = ast_alloca(KAFKA_ERRSTR_MAX_SIZE);
+
+		if(RD_KAFKA_CONF_OK == rd_kafka_conf_set(config, property, value, errstr, KAFKA_ERRSTR_MAX_SIZE)) {
+			return 0;
+		}
+
+		ast_log(LOG_ERROR, "Kafka %s '%s' on cluster '%s': unable to set '%s' property because %s\n", 
+			service_type, service_id, cluster_id, property, errstr);
+
+		return -1;
+	}
+
+	return 0;
 }
 
 /*! Process Kafka producer related topic at the cluster */
@@ -1975,7 +2058,6 @@ static int load_module(void) {
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CLUSTER, "sasl_username", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_cluster, sasl_username));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CLUSTER, "sasl_password", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_cluster, sasl_password));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CLUSTER, "client_id", "asterisk", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_cluster, client_id));
-	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CLUSTER, "retry_backoff_ms", "100", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_cluster, retry_backoff_ms));
 
 	if(sorcery_object_register(KAFKA_TOPIC, sorcery_kafka_topic_alloc, sorcery_kafka_topic_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
@@ -2012,9 +2094,10 @@ static int load_module(void) {
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "request_required_acks", "-1", OPT_INT_T, 0, FLDSET(struct sorcery_kafka_producer, request_required_acks));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "max_in_flight_requests_per_connection", "1000000", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_producer, max_in_flight_requests_per_connection));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "message_send_max_retries", "2", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_producer, message_send_max_retries));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "retry_backoff_ms", "100", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_producer, retry_backoff_ms));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "enable_idempotence", "no", OPT_BOOL_T, 1, FLDSET(struct sorcery_kafka_producer, enable_idempotence));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "transactional_id", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, transactional_id));
-	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "client_id", "asterisk", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, client_id));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "client_id", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, client_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "debug", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, debug));
 
 
@@ -2053,7 +2136,7 @@ static int load_module(void) {
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "partition", "-1", OPT_INT_T, 0, FLDSET(struct sorcery_kafka_consumer, partition));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "enable_auto_commit", "yes", OPT_BOOL_T, 1, FLDSET(struct sorcery_kafka_consumer, enable_auto_commit));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "auto_commit_interval", "5000", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_consumer, auto_commit_interval_ms));
-	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "client_id", "asterisk", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, client_id));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "client_id", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, client_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "debug", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, debug));
 
 
