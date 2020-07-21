@@ -5,9 +5,9 @@ This module provide backend to connect Kafka brokers as producer and consumer se
 
 Configuration stored by Asterisk sorcery, default in file kafka.conf
 
-[cluster_1]
+**[cluster_1]**
 
-type=cluster
+**type=cluster**
 
 brokers=rocket-01.srvs.cloudkafka.com:9094,rocket-02.srvs.cloudkafka.com:9094,rocket-03.srvs.cloudkafka.com:9094
 
@@ -20,28 +20,37 @@ sasl_username=...
 sasl_password=...
 
 
-[producer_a]
+**[producer_a]**
 
-type=producer
+**type=producer**
+
 cluster=cluster_1
 
-[consumer_b]
+**[consumer_b]**
 
-type=consumer
+**type=consumer**
+
 cluster=cluster_1
 partition=0
 
-[topic_a]
+**[topic_a]**
 
-type=topic
+**type=topic**
+
 pipe=pipe_1
+
 topic=topic_for_producer
+
 producer=producer_a
 
-[topic_b]
-type=topic
+**[topic_b]**
+
+**type=topic**
+
 pipe=pipe_1
+
 topic=topic_for_consumer
+
 consumer=consumer_a
 
 For this example if other Asterisk modules send a message to the "pipe_1",
