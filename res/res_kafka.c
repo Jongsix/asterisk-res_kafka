@@ -544,7 +544,7 @@ int ast_kafka_publish(struct ast_kafka_pipe *pipe, const char *key,
 				"eid", eid_str,
 				"uuid", pbx_uuid,
 				"sysname", ast_config_AST_SYSTEM_NAME,
-				"payload", payload);
+				"payload", ast_json_ref(payload));
 	
 	return ast_kafka_send_json_message(pipe, key, json);
 }
@@ -559,7 +559,7 @@ int ast_kafka_send_json_message(struct ast_kafka_pipe *pipe, const char *key,
 	if(raw) {
 		ast_debug(3, "Message to send: '%s'", raw);
 		
-//		processed = ast_kafka_send_raw_message(pipe, key, raw, strlen(raw));
+		processed = ast_kafka_send_raw_message(pipe, key, raw, strlen(raw));
 
 		ast_json_free(raw);
 	}
@@ -2242,9 +2242,10 @@ static int reload_module(void) {
 	return 0;
 }
 
-AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_DEFAULT, "Kafka resources",
+AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_ORDER, "Kafka resources",
 	.support_level = AST_MODULE_SUPPORT_EXTENDED,
 	.load = load_module,
 	.unload = unload_module,
 	.reload = reload_module,
+	.load_pri = AST_MODPRI_DEFAULT,
 	);
