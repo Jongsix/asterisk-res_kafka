@@ -29,7 +29,8 @@ int ast_kafka_publish(struct ast_kafka_pipe *pipe, const char *key,
 			const char *reason, struct ast_json *payload);
 
 int ast_kafka_send_json_message(struct ast_kafka_pipe *pipe, const char *key, 
-				struct ast_json *json);
+				struct ast_json *json,
+				const char *reason);
 
 /*!
  * \brief Send raw message to the specified pipe.
@@ -43,11 +44,13 @@ int ast_kafka_send_json_message(struct ast_kafka_pipe *pipe, const char *key,
  * \param key - Kafka message key, can be NULL
  * \param payoad
  * \param payload_size
+ * \param reason - reason to message (added to message header) or NULL
  * 
  * \return
  */
 int ast_kafka_send_raw_message(struct ast_kafka_pipe *pipe, const char *key, 
-				const void *payload, size_t payload_size);
+				const void *payload, size_t payload_size,
+				const char *reason);
 /*!
  * 
  */

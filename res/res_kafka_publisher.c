@@ -63,7 +63,6 @@ static void device_state_cb(void *data, struct stasis_subscription *sub, struct 
         enum ast_device_state state;
         const char *device;
 	RAII_VAR(struct ast_kafka_pipe *, pipe, NULL, ao2_cleanup);
-//	char *s;
 	
         if (stasis_message_type(message) != ast_device_state_message_type()) {
                 return;
@@ -88,12 +87,6 @@ static void device_state_cb(void *data, struct stasis_subscription *sub, struct 
 	}
 	
 	ast_debug(3, "Device '%s' change state to %u '%s'.\n", device, state, ast_devstate_str(state));
-	
-//	s = ast_json_dump_string(json);
-	
-//	ast_debug(3, "Device '%s' change state to %u '%s'. Event: '%s'\n", device, state, ast_devstate_str(state), s);
-	
-//	ast_json_free(s);
 }
 
 static int load_module(void) {

@@ -382,19 +382,6 @@ struct kafka_topic {
 	struct kafka_service *service;
 	/*! librdkafka topic's handle */
 	rd_kafka_topic_t *rd_kafka_topic;
-#if 0
-	/*! Producer or consumer specific */
-	union {
-		/*! Producer specific */
-		struct {
-		} producer;
-		/*! Consumer specific */
-		struct {
-			/*! Need to call rd_kafka_consume_stop() */
-			int consume_started;
-		} consumer;
-	} specific;
-#endif
 };
 
 /*! Internal representation of message pipe */
@@ -409,15 +396,24 @@ struct ast_kafka_pipe {
 	AST_LIST_HEAD(/*consumer_topics_s*/, kafka_topic) consumer_topics;
 };
 
+/*! Additional message options */
+struct message_options {
+	/*! Message key or NULL */
+	const char *key;
+	/*! Message headers or NULL */
+	rd_kafka_headers_t *headers;
+};
+
 /* Fowrdwd local functions declaration */
 
-static int send_message(struct kafka_topic *topic, void *opaque_1, void *opaque_2, struct ast_kafka_pipe *pipe);
+static rd_kafka_headers_t *build_message_headers(const char *reason);
+static int send_message(struct kafka_topic *topic, void *opaque_1, void *opaque_2, const void *options, struct ast_kafka_pipe *pipe);
 
 static char *handle_kafka_loopback(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *handle_kafka_show(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *complete_pipe_choice(const char *word);
 static int show_pipes_cb(void *obj, void *arg, int flags);
-static int cli_show_topic_cb(struct kafka_topic *topic, void *opaque_1, void *opaque_2, struct ast_kafka_pipe *pipe);
+static int cli_show_topic_cb(struct kafka_topic *topic, void *opaque_1, void *opaque_2, const void *options, struct ast_kafka_pipe *pipe);
 
 
 static void on_producer_created(const void *obj);
@@ -471,8 +467,8 @@ static void on_consumer_message_processed(rd_kafka_t *rd_kafka, const rd_kafka_m
 static int on_all_producers(int (*callback)(struct kafka_service *service, void *opaque), void *opaque, int lock, int wrlock);
 static int on_all_consumers(int (*callback)(struct kafka_service *service, void *opaque), void *opaque, int lock, int wrlock);
 
-static int on_all_producer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaque_1, void *opaque_2, struct ast_kafka_pipe *pipe), void *opaque_1, void *opaque_2);
-static int on_all_consumer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaque_1, void *opaque_2, struct ast_kafka_pipe *pipe), void *opaque_1, void *opaque_2);
+static int on_all_producer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaque_1, void *opaque_2, const void *options, struct ast_kafka_pipe *pipe), void *opaque_1, void *opaque_2, const void *options);
+static int on_all_consumer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaque_1, void *opaque_2, const void *options, struct ast_kafka_pipe *pipe), void *opaque_1, void *opaque_2, const void *options);
 static struct kafka_service *rdkafka_topic_to_service(const rd_kafka_topic_t *rd_kafka_topic);
 static struct kafka_topic *rdkafka_topic_to_topic(const rd_kafka_topic_t *rd_kafka_topic);
 
@@ -493,6 +489,9 @@ static void sorcery_kafka_cluster_destructor(void *obj);
 static void *kafka_pipe_alloc(const char *pipe_id);
 static void kafka_pipe_destructor(void *obj);
 
+static void update_global_producer_eid(void);
+static void clear_global_producer_eid(void);
+
 static struct ast_cli_entry kafka_cli[] = {
 	AST_CLI_DEFINE(handle_kafka_show, "Show module data"),
 	AST_CLI_DEFINE(handle_kafka_loopback, "Loopback test operations"),
@@ -504,6 +503,9 @@ static const struct ast_sorcery_observer producer_observers = {
 	.deleted = on_producer_deleted,
 	.loaded = on_producer_loaded,
 };
+
+/*! Global producer's EID */
+char *global_producer_eid;
 
 /*! Protect access to the monitor variable */
 AST_MUTEX_DEFINE_STATIC(monitor_lock);
@@ -528,38 +530,32 @@ static struct ao2_container *pipes;
 
 int ast_kafka_publish(struct ast_kafka_pipe *pipe, const char *key, 
 			const char *reason, struct ast_json *payload) {
-	char eid_str[128];
 	char pbx_uuid[AST_UUID_STR_LEN];
 	RAII_VAR(struct ast_json *, json, NULL, ast_json_unref);
 	
-        if(ast_eid_is_empty(&ast_eid_default)) {
-                ast_log(LOG_WARNING, "Entity ID is not set.\n");
-	}
-	
-        ast_eid_to_str(eid_str, sizeof(eid_str), &ast_eid_default);
         ast_pbx_uuid_get(pbx_uuid, sizeof(pbx_uuid));
 
         json = ast_json_pack("{s: s, s: s, s: s, s:s, s: o}",
 				"reason", reason,
-				"eid", eid_str,
+				"eid", global_producer_eid,
 				"uuid", pbx_uuid,
 				"sysname", ast_config_AST_SYSTEM_NAME,
 				"payload", ast_json_ref(payload));
 	
-	return ast_kafka_send_json_message(pipe, key, json);
+	return ast_kafka_send_json_message(pipe, key, json, reason);
 }
-
 
 /*! Module API: Send json message to the pipe */
 int ast_kafka_send_json_message(struct ast_kafka_pipe *pipe, const char *key, 
-				struct ast_json *json) {
+				struct ast_json *json,
+				const char *reason) {
 	int processed = 0;
 	char *raw = ast_json_dump_string(json);
 	
 	if(raw) {
 		ast_debug(3, "Message to send: '%s'", raw);
 		
-		processed = ast_kafka_send_raw_message(pipe, key, raw, strlen(raw));
+		processed = ast_kafka_send_raw_message(pipe, key, raw, strlen(raw), reason);
 
 		ast_json_free(raw);
 	}
@@ -569,14 +565,80 @@ int ast_kafka_send_json_message(struct ast_kafka_pipe *pipe, const char *key,
 
 /*! Module API: Send raw message to the pipe */
 int ast_kafka_send_raw_message(struct ast_kafka_pipe *pipe, const char *key, 
-				const void *payload, size_t payload_size) {
-	return on_all_producer_topics(pipe, send_message, (void*)payload, &payload_size);
+				const void *payload, size_t payload_size,
+				const char *reason) {
+	int processed;
+	struct message_options options = {
+		.key = key,
+		.headers = build_message_headers(reason),
+	};
+	
+	processed = on_all_producer_topics(pipe, send_message, (void*)payload, &payload_size, &options);
+	
+	if(options.headers) {
+		rd_kafka_headers_destroy(options.headers);
+	}
+	
+	return processed;
 }
 
-static int send_message(struct kafka_topic *topic, void *opaque_1, void *opaque_2, struct ast_kafka_pipe *pipe) {
+/*! Build Kafka's message headers 
+ * 
+ * Added two message headers:
+ * "reason" - event's reason
+ * "eid" - server's EID
+ */
+static rd_kafka_headers_t *build_message_headers(const char *reason) {
+	int processed = 0;
+	rd_kafka_headers_t *headers = rd_kafka_headers_new(2);
+	
+	if(NULL == headers) {
+		ast_log(LOG_WARNING, "Unable to allocate message headers for event '%s'\n", reason);
+		
+		return NULL;
+	}
+	
+	if(reason) {
+		rd_kafka_resp_err_t response = rd_kafka_header_add(headers, "reason", 6, reason, strlen(reason));
+		
+		if(RD_KAFKA_RESP_ERR_NO_ERROR == response) {
+			processed++;
+		} else {
+			ast_log(LOG_WARNING, "Add reason header failed: %s\n", 
+				rd_kafka_err2str(response));
+		}
+	}
+	
+	if(global_producer_eid) {
+		rd_kafka_resp_err_t response = rd_kafka_header_add(headers, "eid", 3, global_producer_eid, strlen(global_producer_eid));
+		
+		if(RD_KAFKA_RESP_ERR_NO_ERROR == response) {
+			processed++;
+		} else {
+			ast_log(LOG_WARNING, "Add eid header failed: %s\n", 
+				rd_kafka_err2str(response));
+		}
+	}
+	
+	if(processed) {
+		return headers;
+	}
+	
+	/* No message headers available */
+	rd_kafka_headers_destroy(headers);
+	
+	return NULL;
+}
+
+/*! Send message to the specified topic */
+static int send_message(struct kafka_topic *topic, void *opaque_1, void *opaque_2, const void *options, struct ast_kafka_pipe *pipe) {
 	void *payload = opaque_1;
 	size_t payload_size = *(size_t *)opaque_2;
-
+	const struct message_options *producer_options = options;
+	const char *key = producer_options ? producer_options->key : NULL;
+	size_t key_size = key ? strlen(key) : 0;
+	rd_kafka_resp_err_t response;
+		
 	if(RD_KAFKA_PARTITION_UA == topic->service->partition) {
 		ast_debug(3, "Kafka pipe %s (%p) try to produce message on topic (%p) via unassigned partition, payload=%p, size=%lu\n", 
 				pipe->id, pipe, topic->rd_kafka_topic, payload, payload_size);
@@ -585,12 +647,80 @@ static int send_message(struct kafka_topic *topic, void *opaque_1, void *opaque_
 				pipe->id, pipe, topic->rd_kafka_topic, topic->service->partition, payload, payload_size);
 	}
 
-	return rd_kafka_produce(topic->rd_kafka_topic, 
+#if 1
+	if(key_size) {
+		/* Send message with key */
+		if(producer_options->headers) {
+			/* Send message with key and headers */
+			rd_kafka_headers_t *copy = rd_kafka_headers_copy(producer_options->headers);
+			
+			response = rd_kafka_producev(topic->service->rd_kafka,
+							RD_KAFKA_V_RKT(topic->rd_kafka_topic),
+							RD_KAFKA_V_PARTITION(topic->service->partition),
+							RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+							RD_KAFKA_V_VALUE(payload, payload_size),
+							RD_KAFKA_V_KEY(key, key_size),
+							RD_KAFKA_V_HEADERS(copy),
+							RD_KAFKA_V_END);
+			
+			if(RD_KAFKA_RESP_ERR_NO_ERROR != response) {
+				rd_kafka_headers_destroy(copy);
+			}
+		} else {
+			/* Send message with key and w/o headers */
+			response = rd_kafka_producev(topic->service->rd_kafka,
+							RD_KAFKA_V_RKT(topic->rd_kafka_topic),
+							RD_KAFKA_V_PARTITION(topic->service->partition),
+							RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+							RD_KAFKA_V_VALUE(payload, payload_size),
+							RD_KAFKA_V_KEY(key, key_size),
+							RD_KAFKA_V_END);
+		}
+	} else {
+		/* Send message w/o key */
+		if(producer_options->headers) {
+			/* Send message w/o key but with headers */
+			rd_kafka_headers_t *copy = rd_kafka_headers_copy(producer_options->headers);
+			
+			response = rd_kafka_producev(topic->service->rd_kafka,
+							RD_KAFKA_V_RKT(topic->rd_kafka_topic),
+							RD_KAFKA_V_PARTITION(topic->service->partition),
+							RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+							RD_KAFKA_V_VALUE(payload, payload_size),
+							RD_KAFKA_V_HEADERS(copy),
+							RD_KAFKA_V_END);
+			
+			if(RD_KAFKA_RESP_ERR_NO_ERROR != response) {
+				rd_kafka_headers_destroy(copy);
+			}
+		} else {
+			/* Send message w/o key and headers */
+			response = rd_kafka_producev(topic->service->rd_kafka,
+							RD_KAFKA_V_RKT(topic->rd_kafka_topic),
+							RD_KAFKA_V_PARTITION(topic->service->partition),
+							RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
+							RD_KAFKA_V_VALUE(payload, payload_size),
+							RD_KAFKA_V_END);
+		}
+	}
+#else
+	/* Can specify key, but w/o headers */
+	response = rd_kafka_produce(topic->rd_kafka_topic, 
 				topic->service->partition, 
 				RD_KAFKA_MSG_F_COPY, 
-				payload, payload_size,	/* payload and payload size*/
-				NULL, 0,		/* key and key size */
-				NULL);
+				payload, payload_size,			/* payload and payload size*/
+				key_size ? key : NULL, key_size,	/* key and key size */
+				NULL) ? rd_kafka_last_error() : RD_KAFKA_RESP_ERR_NO_ERROR;
+#endif
+	
+	if(RD_KAFKA_RESP_ERR_NO_ERROR == response) {
+		return 0;
+	}
+
+	ast_log(LOG_WARNING, "Produce message on pipe '%s' failed: %s\n", 
+		pipe->id, rd_kafka_err2str(response));
+
+	return -1;
 }
 
 /*! Module API: Get existing pipe or create new if not present */
@@ -666,7 +796,7 @@ static char *handle_kafka_loopback(struct ast_cli_entry *e, int cmd, struct ast_
 			if(NULL == pipe) {
 				ast_cli(a->fd, "Pipe '%s' not found\n", a->argv[3]);
 			} else {
-				int res = ast_kafka_send_raw_message(pipe, NULL, "PING LOOPBACK", 13);
+				int res = ast_kafka_send_raw_message(pipe, NULL, "PING LOOPBACK", 13, "LOOPBACK");
 
 				ast_cli(a->fd, "Execute %s on pipe %s with code %d\n", a->argv[4], a->argv[3], res);
 			}
@@ -752,12 +882,12 @@ static char *handle_kafka_show(struct ast_cli_entry *e, int cmd, struct ast_cli_
 			} else {
 				if((0 == strcasecmp(a->argv[4], pipe_option[0])) || (0 == strcasecmp(a->argv[4], pipe_option[1]))) {
 					/* Show services or producers */
-					on_all_producer_topics(pipe, cli_show_topic_cb, a, (char*)pipe_option[1]);
+					on_all_producer_topics(pipe, cli_show_topic_cb, a, (char*)pipe_option[1], NULL);
 				}
 
 				if((0 == strcasecmp(a->argv[4], pipe_option[0])) || (0 == strcasecmp(a->argv[4], pipe_option[2]))) {
 					/* Show services or consumers */
-					on_all_consumer_topics(pipe, cli_show_topic_cb, a, (char*)pipe_option[2]);
+					on_all_consumer_topics(pipe, cli_show_topic_cb, a, (char*)pipe_option[2], NULL);
 				}
 			}
 
@@ -800,7 +930,7 @@ static int show_pipes_cb(void *obj, void *arg, int flags) {
 	return 0;
 }
 
-static int cli_show_topic_cb(struct kafka_topic *topic, void *opaque_1, void *opaque_2, struct ast_kafka_pipe *pipe) {
+static int cli_show_topic_cb(struct kafka_topic *topic, void *opaque_1, void *opaque_2, const void *options, struct ast_kafka_pipe *pipe) {
 	struct ast_cli_args *a = opaque_1;
 	const char *service_type = opaque_2;
 	RAII_VAR(struct kafka_service *, service, rdkafka_topic_to_service(topic->rd_kafka_topic), ao2_cleanup);
@@ -1752,14 +1882,14 @@ static int on_all_consumers(int (*callback)(struct kafka_service *service, void 
 }
 
 /*! Execute callback on all producer topics in the pipe */
-static int on_all_producer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaque_1, void *opaque_2, struct ast_kafka_pipe *pipe), void *opaque_1, void *opaque_2) {
+static int on_all_producer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaque_1, void *opaque_2, const void *options, struct ast_kafka_pipe *pipe), void *opaque_1, void *opaque_2, const void *options) {
 	int status = 0;
 	struct kafka_topic *topic;
 
 	AST_LIST_LOCK(&pipe->producer_topics);
 
 	AST_LIST_TRAVERSE(&pipe->producer_topics, topic, link) {
-		status |= (*callback)(topic, opaque_1, opaque_2, pipe);
+		status |= (*callback)(topic, opaque_1, opaque_2, options, pipe);
 
 		if(status < 0) {
 			/* Fatal error */
@@ -1773,14 +1903,14 @@ static int on_all_producer_topics(struct ast_kafka_pipe *pipe, int (*callback)(s
 }
 
 /*! Execute callback on all consumer topics in the pipe */
-static int on_all_consumer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaque_1, void *opaque_2, struct ast_kafka_pipe *pipe), void *opaque_1, void *opaque_2) {
+static int on_all_consumer_topics(struct ast_kafka_pipe *pipe, int (*callback)(struct kafka_topic *topic, void *opaque_1, void *opaque_2, const void *options, struct ast_kafka_pipe *pipe), void *opaque_1, void *opaque_2, const void *options) {
 	int status = 0;
 	struct kafka_topic *topic;
 
 	AST_LIST_LOCK(&pipe->consumer_topics);
 
 	AST_LIST_TRAVERSE(&pipe->consumer_topics, topic, link) {
-		status |= (*callback)(topic, opaque_1, opaque_2, pipe);
+		status |= (*callback)(topic, opaque_1, opaque_2, options, pipe);
 
 		if(status < 0) {
 			/* Fatal error */
@@ -2044,6 +2174,27 @@ static void kafka_pipe_destructor(void *obj) {
 	ast_string_field_free_memory(pipe);
 }
 
+/*! Update global producer's EID */
+static void update_global_producer_eid(void) {
+	char eid_str[128];
+
+	clear_global_producer_eid();
+
+        if(ast_eid_is_empty(&ast_eid_default)) {
+                ast_log(LOG_WARNING, "Entity ID is not set.\n");
+	}
+	
+        ast_eid_to_str(eid_str, sizeof(eid_str), &ast_eid_default);
+	
+	global_producer_eid = ast_strdup(eid_str);
+}
+
+/*! Clear global producer's EID */
+static void clear_global_producer_eid(void) {
+	ast_free(global_producer_eid);
+	global_producer_eid = NULL;
+}
+
 /*! Calculate hash */
 AO2_STRING_FIELD_HASH_FN(ast_kafka_pipe, id)
 /*! Compare pipes */
@@ -2056,7 +2207,10 @@ static int load_module(void) {
 	AST_RWDLLIST_HEAD_INIT(&producers);
 	AST_RWDLLIST_HEAD_INIT(&consumers);
 
+	update_global_producer_eid();
+	
 	if(NULL == (pipes = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, KAFKA_PIPE_BUCKETS, ast_kafka_pipe_hash_fn, NULL, ast_kafka_pipe_cmp_fn))) {
+		clear_global_producer_eid();
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
 		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
@@ -2067,6 +2221,7 @@ static int load_module(void) {
 //
 //		ao2_cleanup(pipes);
 //		pipes = NULL;
+//		clear_global_producer_eid();
 //		AST_RWDLLIST_HEAD_DESTROY(&producers);
 //		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 //		return AST_MODULE_LOAD_DECLINE;
@@ -2079,6 +2234,7 @@ static int load_module(void) {
 //		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
+		clear_global_producer_eid();
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
 		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
@@ -2091,6 +2247,7 @@ static int load_module(void) {
 //		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
+		clear_global_producer_eid();
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
 		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
@@ -2110,6 +2267,7 @@ static int load_module(void) {
 //		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
+		clear_global_producer_eid();
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
 		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
@@ -2127,6 +2285,7 @@ static int load_module(void) {
 //		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
+		clear_global_producer_eid();
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
 		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
@@ -2154,6 +2313,7 @@ static int load_module(void) {
 //		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
+		clear_global_producer_eid();
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
 		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
@@ -2168,6 +2328,7 @@ static int load_module(void) {
 //		kafka_tps = NULL;
 		ao2_cleanup(pipes);
 		pipes = NULL;
+		clear_global_producer_eid();
 		AST_RWDLLIST_HEAD_DESTROY(&producers);
 		AST_RWDLLIST_HEAD_DESTROY(&consumers);
 		return AST_MODULE_LOAD_DECLINE;
@@ -2233,10 +2394,14 @@ static int unload_module(void) {
 	AST_RWDLLIST_HEAD_DESTROY(&producers);
 	AST_RWDLLIST_HEAD_DESTROY(&consumers);
 
+	clear_global_producer_eid();
+	
 	return 0;
 }
 
 static int reload_module(void) {
+	update_global_producer_eid();
+	
 	ast_sorcery_reload(kafka_sorcery);
 
 	return 0;
