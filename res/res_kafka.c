@@ -407,7 +407,7 @@ struct message_options {
 /* Fowrdwd local functions declaration */
 
 static rd_kafka_headers_t *build_message_headers(const char *reason);
-static int send_message(struct kafka_topic *topic, void *opaque_1, void *opaque_2, const void *options, struct ast_kafka_pipe *pipe);
+static int produce_message(struct kafka_topic *topic, void *opaque_1, void *opaque_2, const void *options, struct ast_kafka_pipe *pipe);
 
 static char *handle_kafka_loopback(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *handle_kafka_show(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
@@ -504,8 +504,11 @@ static const struct ast_sorcery_observer producer_observers = {
 	.loaded = on_producer_loaded,
 };
 
+/*! PBX UUID */
+static char pbx_uuid[AST_UUID_STR_LEN];
+
 /*! Global producer's EID */
-char *global_producer_eid;
+static char *global_producer_eid;
 
 /*! Protect access to the monitor variable */
 AST_MUTEX_DEFINE_STATIC(monitor_lock);
@@ -530,11 +533,8 @@ static struct ao2_container *pipes;
 
 int ast_kafka_publish(struct ast_kafka_pipe *pipe, const char *key, 
 			const char *reason, struct ast_json *payload) {
-	char pbx_uuid[AST_UUID_STR_LEN];
 	RAII_VAR(struct ast_json *, json, NULL, ast_json_unref);
 	
-        ast_pbx_uuid_get(pbx_uuid, sizeof(pbx_uuid));
-
         json = ast_json_pack("{s: s, s: s, s: s, s:s, s: o}",
 				"reason", reason,
 				"eid", global_producer_eid,
@@ -573,7 +573,7 @@ int ast_kafka_send_raw_message(struct ast_kafka_pipe *pipe, const char *key,
 		.headers = build_message_headers(reason),
 	};
 	
-	processed = on_all_producer_topics(pipe, send_message, (void*)payload, &payload_size, &options);
+	processed = on_all_producer_topics(pipe, produce_message, (void*)payload, &payload_size, &options);
 	
 	if(options.headers) {
 		rd_kafka_headers_destroy(options.headers);
@@ -631,7 +631,7 @@ static rd_kafka_headers_t *build_message_headers(const char *reason) {
 }
 
 /*! Send message to the specified topic */
-static int send_message(struct kafka_topic *topic, void *opaque_1, void *opaque_2, const void *options, struct ast_kafka_pipe *pipe) {
+static int produce_message(struct kafka_topic *topic, void *opaque_1, void *opaque_2, const void *options, struct ast_kafka_pipe *pipe) {
 	void *payload = opaque_1;
 	size_t payload_size = *(size_t *)opaque_2;
 	const struct message_options *producer_options = options;
@@ -2207,6 +2207,8 @@ static int load_module(void) {
 	AST_RWDLLIST_HEAD_INIT(&producers);
 	AST_RWDLLIST_HEAD_INIT(&consumers);
 
+        ast_pbx_uuid_get(pbx_uuid, sizeof(pbx_uuid));
+
 	update_global_producer_eid();
 	
 	if(NULL == (pipes = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, KAFKA_PIPE_BUCKETS, ast_kafka_pipe_hash_fn, NULL, ast_kafka_pipe_cmp_fn))) {
@@ -2400,6 +2402,8 @@ static int unload_module(void) {
 }
 
 static int reload_module(void) {
+        ast_pbx_uuid_get(pbx_uuid, sizeof(pbx_uuid));
+
 	update_global_producer_eid();
 	
 	ast_sorcery_reload(kafka_sorcery);

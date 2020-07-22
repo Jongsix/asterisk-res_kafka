@@ -25,9 +25,39 @@
 
 struct ast_kafka_pipe;
 
+/*!
+ * \brief Publish event to the specified pipe.
+ * 
+ * \details
+ * Publish event to the specified pipe.
+ * 
+ * \note
+ * 
+ * \param pipe
+ * \param key - Kafka message key, can be NULL
+ * \param reason - event reason
+ * \param payload
+ * 
+ * \return
+ */
 int ast_kafka_publish(struct ast_kafka_pipe *pipe, const char *key, 
 			const char *reason, struct ast_json *payload);
 
+/*!
+ * \brief Send json message to the specified pipe.
+ * 
+ * \details
+ * Send json message to the specified pipe.
+ * 
+ * \note
+ * 
+ * \param pipe
+ * \param key - Kafka message key, can be NULL
+ * \param json
+ * \param reason - reason for message (added to message header) or NULL
+ * 
+ * \return
+ */
 int ast_kafka_send_json_message(struct ast_kafka_pipe *pipe, const char *key, 
 				struct ast_json *json,
 				const char *reason);
@@ -36,7 +66,7 @@ int ast_kafka_send_json_message(struct ast_kafka_pipe *pipe, const char *key,
  * \brief Send raw message to the specified pipe.
  * 
  * \details
- * Send message to the specified pipe.
+ * Send raw message to the specified pipe.
  * 
  * \note
  * 
@@ -44,7 +74,7 @@ int ast_kafka_send_json_message(struct ast_kafka_pipe *pipe, const char *key,
  * \param key - Kafka message key, can be NULL
  * \param payoad
  * \param payload_size
- * \param reason - reason to message (added to message header) or NULL
+ * \param reason - reason for message (added to message header) or NULL
  * 
  * \return
  */
