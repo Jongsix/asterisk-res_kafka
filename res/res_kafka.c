@@ -236,10 +236,14 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 #include "asterisk/stringfields.h"
 #include "asterisk/utils.h"
 #include "asterisk/lock.h"
+/* define ast_config_AST_SYSTEM_NAME */
+#include "asterisk/paths.h"
+
 
 #include "librdkafka/rdkafka.h"
 
 #include <unistd.h>
+#include <string.h>
 
 #define KAFKA_CONFIG_FILENAME "kafka.conf"
 
@@ -405,7 +409,7 @@ struct ast_kafka_pipe {
 	AST_LIST_HEAD(/*consumer_topics_s*/, kafka_topic) consumer_topics;
 };
 
-/*! Fowrdwd local functions declaration */
+/* Fowrdwd local functions declaration */
 
 static int send_message(struct kafka_topic *topic, void *opaque_1, void *opaque_2, struct ast_kafka_pipe *pipe);
 
@@ -522,9 +526,49 @@ static struct ast_sorcery *kafka_sorcery;
 /*! Defined pipes container */
 static struct ao2_container *pipes;
 
+int ast_kafka_publish(struct ast_kafka_pipe *pipe, const char *key, 
+			const char *reason, struct ast_json *payload) {
+	char eid_str[128];
+	char pbx_uuid[AST_UUID_STR_LEN];
+	RAII_VAR(struct ast_json *, json, NULL, ast_json_unref);
+	
+        if(ast_eid_is_empty(&ast_eid_default)) {
+                ast_log(LOG_WARNING, "Entity ID is not set.\n");
+	}
+	
+        ast_eid_to_str(eid_str, sizeof(eid_str), &ast_eid_default);
+        ast_pbx_uuid_get(pbx_uuid, sizeof(pbx_uuid));
 
-/*! Module API: Send message to the pipe */
-int ast_kafka_send_message(struct ast_kafka_pipe *pipe, const char *key, 
+        json = ast_json_pack("{s: s, s: s, s: s, s:s, s: o}",
+				"reason", reason,
+				"eid", eid_str,
+				"uuid", pbx_uuid,
+				"sysname", ast_config_AST_SYSTEM_NAME,
+				"payload", payload);
+	
+	return ast_kafka_send_json_message(pipe, key, json);
+}
+
+
+/*! Module API: Send json message to the pipe */
+int ast_kafka_send_json_message(struct ast_kafka_pipe *pipe, const char *key, 
+				struct ast_json *json) {
+	int processed = 0;
+	char *raw = ast_json_dump_string(json);
+	
+	if(raw) {
+		ast_debug(3, "Message to send: '%s'", raw);
+		
+//		processed = ast_kafka_send_raw_message(pipe, key, raw, strlen(raw));
+
+		ast_json_free(raw);
+	}
+	
+	return processed;
+}
+
+/*! Module API: Send raw message to the pipe */
+int ast_kafka_send_raw_message(struct ast_kafka_pipe *pipe, const char *key, 
 				const void *payload, size_t payload_size) {
 	return on_all_producer_topics(pipe, send_message, (void*)payload, &payload_size);
 }
@@ -622,7 +666,7 @@ static char *handle_kafka_loopback(struct ast_cli_entry *e, int cmd, struct ast_
 			if(NULL == pipe) {
 				ast_cli(a->fd, "Pipe '%s' not found\n", a->argv[3]);
 			} else {
-				int res = ast_kafka_send_message(pipe, NULL, "PING LOOPBACK", 13);
+				int res = ast_kafka_send_raw_message(pipe, NULL, "PING LOOPBACK", 13);
 
 				ast_cli(a->fd, "Execute %s on pipe %s with code %d\n", a->argv[4], a->argv[3], res);
 			}

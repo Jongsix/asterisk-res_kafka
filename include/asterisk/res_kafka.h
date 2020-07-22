@@ -21,10 +21,18 @@
 #ifndef _ASTERISK_RES_KAFKA_H
 #define _ASTERISK_RES_KAFKA_H
 
+#include "asterisk/json.h"
+
 struct ast_kafka_pipe;
 
+int ast_kafka_publish(struct ast_kafka_pipe *pipe, const char *key, 
+			const char *reason, struct ast_json *payload);
+
+int ast_kafka_send_json_message(struct ast_kafka_pipe *pipe, const char *key, 
+				struct ast_json *json);
+
 /*!
- * \brief Send message to the specified pipe.
+ * \brief Send raw message to the specified pipe.
  * 
  * \details
  * Send message to the specified pipe.
@@ -38,7 +46,7 @@ struct ast_kafka_pipe;
  * 
  * \return
  */
-int ast_kafka_send_message(struct ast_kafka_pipe *pipe, const char *key, 
+int ast_kafka_send_raw_message(struct ast_kafka_pipe *pipe, const char *key, 
 				const void *payload, size_t payload_size);
 /*!
  * 
