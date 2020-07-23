@@ -230,6 +230,23 @@
 				<configOption name="consumer">
 					<synopsis>Consumer resource id</synopsis>
 				</configOption>
+				<configOption name="message_timeout_ms" default="300000">
+					<synopsis>message.timeout.ms</synopsis>
+					<description><para>
+						Local message timeout. 
+						This value is only enforced locally and limits the time a
+						produced message waits for successful delivery. 
+						A time of 0 is infinite. This is the maximum time 
+						librdkafka may use to deliver a message
+						(including retries). Delivery error occurs when either
+						the retry count or the message timeout are exceeded.
+						The message timeout is automatically adjusted to
+						transaction.timeout.ms if transactional.id is configured.
+						</para>
+						<para>Kafka property: message.timeout.ms</para>
+						<para>Default value: 300000</para>
+					</description>
+				</configOption>
 			</configObject>
 		</configFile>
 	</configInfo>
@@ -367,6 +384,8 @@ struct sorcery_kafka_topic {
 		/*! Consumer resource id */
 		AST_STRING_FIELD(consumer_id);
 	);
+	/*! message.timeout.ms */
+	unsigned int message_timeout_ms;
 };
 
 /*! Internal representation of Kafka's producer or consumer service */
@@ -481,6 +500,17 @@ static struct kafka_topic *new_kafka_producer_topic(struct kafka_service *produc
 static void kafka_producer_topic_destructor(void *obj);
 static struct kafka_topic *new_kafka_consumer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic);
 static void kafka_consumer_topic_destructor(void *obj);
+
+static int topic_add_property_int(rd_kafka_topic_conf_t  *config, 
+					const char *property, int value, 
+					const char *topic_id);
+static int topic_add_property_uint(rd_kafka_topic_conf_t  *config, 
+					const char *property, unsigned value, 
+					const char *topic_id);
+static int topic_add_property_string(rd_kafka_topic_conf_t  *config, 
+					const char *property, const char *value,
+					const char *topic_id);
+
 
 static int start_monitor_thread(void);
 static void *monitor_thread_job(void *opaque);
@@ -1607,6 +1637,14 @@ static struct kafka_topic *new_kafka_producer_topic(struct kafka_service *produc
 		/* With topic's callbacks we want see the kafka_producer_topic structure reference */
 		rd_kafka_topic_conf_set_opaque(config, topic);
 
+		if(topic_add_property_uint(config, 
+						"message.timeout.ms", sorcery_topic->message_timeout_ms,
+						ast_sorcery_object_get_id(sorcery_topic))) {
+			rd_kafka_topic_conf_destroy(config);
+			ao2_ref(topic, -1);
+			return NULL;
+		}
+		
 		if(NULL == (topic->rd_kafka_topic = rd_kafka_topic_new(producer->rd_kafka, sorcery_topic->topic, config))) {
 			ast_log(LOG_ERROR, "Unable to create producer topic '%s' because %s\n", ast_sorcery_object_get_id(sorcery_topic), rd_kafka_err2str(rd_kafka_last_error()));
 			rd_kafka_topic_conf_destroy(config);
@@ -1763,6 +1801,50 @@ static void kafka_consumer_topic_destructor(void *obj) {
 	}
 }
 
+/*! Add signed integer property value to the Kafka configuration */
+static int topic_add_property_int(rd_kafka_topic_conf_t *config, 
+					const char *property, int value, 
+					const char *topic_id) {
+	char *tmp = ast_alloca(TMP_BUF_SIZE);
+	
+	snprintf(tmp, TMP_BUF_SIZE, "%d", value);
+
+	return topic_add_property_string(config, property, tmp, topic_id);
+}
+
+/*! Add unsigned integer property value to the Kafka configuration */
+static int topic_add_property_uint(rd_kafka_topic_conf_t *config, 
+					const char *property, unsigned value, 
+					const char *topic_id) {
+	char *tmp = ast_alloca(TMP_BUF_SIZE);
+	
+	snprintf(tmp, TMP_BUF_SIZE, "%u", value);
+
+	return topic_add_property_string(config, property, tmp, topic_id);
+}
+
+/*! Add string property value to the Kafka configuration */
+static int topic_add_property_string(rd_kafka_topic_conf_t  *config, 
+					const char *property, const char *value,
+					const char *topic_id) {
+	if(value && strlen(value)) {
+		char *errstr = ast_alloca(KAFKA_ERRSTR_MAX_SIZE);
+
+		if(RD_KAFKA_CONF_OK == rd_kafka_topic_conf_set(config, property, value, errstr, KAFKA_ERRSTR_MAX_SIZE)) {
+			return 0;
+		}
+
+		ast_log(LOG_ERROR, "Kafka topic '%s': unable to set '%s' property because %s\n", 
+			topic_id, property, errstr);
+
+		return -1;
+	}
+
+	return 0;
+}
+
+
+
 
 
 /*! Start monitor thread if possible */
@@ -1875,12 +1957,33 @@ static void *monitor_thread_job(void *opaque) {
 
 /*! Called by librdkafka when producer message processing complete */
 static void on_producer_message_processed(rd_kafka_t *rd_kafka, const rd_kafka_message_t *message, void *opaque) {
-	ast_debug(3,"on_producer_message_processed(%p, %p, %p). Status: %s\n", rd_kafka, message, opaque, rd_kafka_err2str(message->err));
+	const struct kafka_service *producer = opaque;
+	
+	if(RD_KAFKA_RESP_ERR_NO_ERROR == message->err) {
+		/* Message successfully sent to the broker */
+		ast_debug(3, "Message sent to the topic '%s'\n", rd_kafka_topic_name(message->rkt));
+	} else {
+		/* Producer's message sending fatal error occured*/
+		ast_log(LOG_ERROR, "Unable to sent message to the topic '%s' by '%s'. Reason: %s\n", 
+			rd_kafka_topic_name(message->rkt), rd_kafka_name(rd_kafka), 
+			rd_kafka_err2str(message->err));
+	}
 }
 
 /*! Called by librdkafka when consumer message processing complete */
 static void on_consumer_message_processed(rd_kafka_t *rd_kafka, const rd_kafka_message_t *message, void *opaque) {
-	ast_debug(3,"on_consumer_message_processed(%p, %p, %p)\n", rd_kafka, message, opaque);
+	const struct kafka_topic *topic = opaque;
+
+//	ast_debug(3,"on_consumer_message_processed(%p, %p, %p)\n", rd_kafka, message, opaque);
+	if(RD_KAFKA_RESP_ERR_NO_ERROR == message->err) {
+		/* Message successfully sent to the broker */
+		ast_debug(3, "Message received from the topic '%s'\n", rd_kafka_topic_name(message->rkt));
+	} else {
+		/* Producer's message sending fatal error occured*/
+		ast_log(LOG_ERROR, "Unable to receive message from the topic '%s' by '%s'. Reason: %s\n", 
+			rd_kafka_topic_name(message->rkt), rd_kafka_name(rd_kafka), 
+			rd_kafka_err2str(message->err));
+	}
 }
 
 
@@ -2339,6 +2442,7 @@ static int load_module(void) {
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "topic", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_topic, topic));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "producer", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_topic, producer_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "consumer", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_topic, consumer_id));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "message_timeout_ms", "300000", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_topic, message_timeout_ms));
 
 	if(sorcery_object_register(KAFKA_PRODUCER, sorcery_kafka_producer_alloc, sorcery_kafka_producer_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
