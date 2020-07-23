@@ -64,7 +64,7 @@ static struct stasis_subscription *device_state_subscription;
 static void device_state_cb(void *data, struct stasis_subscription *sub, struct stasis_message *message) {
         struct ast_device_state_message *payload;
         enum ast_device_state state;
-        const char *device, *skip_tech;
+        const char *device, *skip_tech, *key;
 	RAII_VAR(struct ast_kafka_pipe *, pipe, NULL, ao2_cleanup);
 	
         if (stasis_message_type(message) != ast_device_state_message_type()) {
@@ -84,15 +84,17 @@ static void device_state_cb(void *data, struct stasis_subscription *sub, struct 
                 return;
         }
 
-	if(NULL != (skip_tech = strchr(device, '/'))) {
+	if(NULL == (skip_tech = strchr(device, '/'))) {
+		key = device;
+	} else {
 		/* skip_tech point to the '/' after channel tech */
-		device = skip_tech + sizeof(char);
+		key = skip_tech + sizeof(char);
 	}
 	
 	
 	if(NULL != (pipe = ast_kafka_get_pipe(KAFKA_PIPE_DEVICE_STATE,0))) {
 		RAII_VAR(struct ast_json *, json, stasis_app_device_state_to_json(device, state), ast_json_unref);
-		ast_kafka_publish(pipe, device, KAFKA_PIPE_DEVICE_STATE, json);
+		ast_kafka_publish(pipe, key, KAFKA_PIPE_DEVICE_STATE, json);
 	}
 	
 	ast_debug(3, "Device '%s' change state to %u '%s'.\n", device, state, ast_devstate_str(state));
