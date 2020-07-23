@@ -3,7 +3,7 @@
  *
  * Copyright (C) 2020, Vedga
  *
- * Igor Nikolaev <igorn@ozon.ru>
+ * Igor Nikolaev <support@vedga.com>
  *
  * See http://www.asterisk.org for more information about
  * the Asterisk project. Please do not directly contact
