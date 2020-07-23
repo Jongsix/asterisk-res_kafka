@@ -107,6 +107,22 @@
 				<configOption name="cluster">
 					<synopsis>Cluster resource id</synopsis>
 				</configOption>
+				<configOption name="key_overwrite" default="no">
+					<synopsis>Overwrite producer's key</synopsis>
+					<description>
+						<enumlist>
+							<enum name="no" />
+							<enum name="uuid" />
+							<enum name="value" />
+							<enum name="null" />
+						</enumlist>
+					</description>
+				</configOption>
+				<configOption name="key_value">
+					<synopsis>Producer's key static value</synopsis>
+					<description>
+					</description>
+				</configOption>
 				<configOption name="timeout" default="10000">
 					<synopsis>Default service timeout, ms. Default 10000ms.</synopsis>
 				</configOption>
@@ -286,6 +302,10 @@ struct sorcery_kafka_producer {
 	AST_DECLARE_STRING_FIELDS(
 		/*! Cluster resource id */
 		AST_STRING_FIELD(cluster_id);
+		/*! Overwrite producer's key ('no', 'uuid', 'value', 'null') */
+		AST_STRING_FIELD(key_overwrite);
+		/*! Producer's static key value */
+		AST_STRING_FIELD(key_value);
 		/*! Client identifier */
 		AST_STRING_FIELD(client_id);
 		/*! transactional.id */
@@ -339,7 +359,7 @@ struct sorcery_kafka_topic {
 	SORCERY_OBJECT(defails);
 	AST_DECLARE_STRING_FIELDS(
 		/*! Pipe id, used by Asterisk modules to produce or consume messages */
-		AST_STRING_FIELD(pipe);
+		AST_STRING_FIELD(pipe_id);
 		/*! Kafka topic name */
 		AST_STRING_FIELD(topic);
 		/*! Producer resource id */
@@ -365,6 +385,10 @@ struct kafka_service {
 	union {
 		/*! Producer specific */
 		struct {
+			/*! Forced key value or NULL */
+			char *forced_key;
+			/*! Force key is null */
+			int force_null_key;
 		} producer;
 		/*! Consumer specific */
 		struct {
@@ -504,9 +528,6 @@ static const struct ast_sorcery_observer producer_observers = {
 	.loaded = on_producer_loaded,
 };
 
-/*! PBX UUID */
-static char pbx_uuid[AST_UUID_STR_LEN];
-
 /*! Global producer's EID */
 static char *global_producer_eid;
 
@@ -535,10 +556,9 @@ int ast_kafka_publish(struct ast_kafka_pipe *pipe, const char *key,
 			const char *reason, struct ast_json *payload) {
 	RAII_VAR(struct ast_json *, json, NULL, ast_json_unref);
 	
-        json = ast_json_pack("{s: s, s: s, s: s, s:s, s: o}",
+        json = ast_json_pack("{s: s, s: s, s: s, s: o}",
 				"reason", reason,
 				"eid", global_producer_eid,
-				"uuid", pbx_uuid,
 				"sysname", ast_config_AST_SYSTEM_NAME,
 				"payload", ast_json_ref(payload));
 	
@@ -635,10 +655,22 @@ static int produce_message(struct kafka_topic *topic, void *opaque_1, void *opaq
 	void *payload = opaque_1;
 	size_t payload_size = *(size_t *)opaque_2;
 	const struct message_options *producer_options = options;
-	const char *key = producer_options ? producer_options->key : NULL;
-	size_t key_size = key ? strlen(key) : 0;
+	const char *suggested_key = producer_options ? producer_options->key : NULL;
+	const char *key;
+	size_t key_size;
 	rd_kafka_resp_err_t response;
 		
+	if(topic->service->specific.producer.force_null_key) {
+		/* Force null key */
+		key = NULL;
+	} else {
+		/* Select static or suggested key value */
+		key = topic->service->specific.producer.forced_key ? topic->service->specific.producer.forced_key : suggested_key;
+	}
+	
+	/* Determine used key size */
+	key_size = key ? strlen(key) : 0;
+	
 	if(RD_KAFKA_PARTITION_UA == topic->service->partition) {
 		ast_debug(3, "Kafka pipe %s (%p) try to produce message on topic (%p) via unassigned partition, payload=%p, size=%lu\n", 
 				pipe->id, pipe, topic->rd_kafka_topic, payload, payload_size);
@@ -1214,6 +1246,34 @@ static struct kafka_service *new_kafka_producer(const struct sorcery_kafka_clust
 	} else {
 		char *errstr = ast_alloca(KAFKA_ERRSTR_MAX_SIZE);
 
+		if(0 == strcasecmp(sorcery_producer->key_overwrite, "uuid")) {
+			char pbx_uuid[AST_UUID_STR_LEN];
+
+			ast_pbx_uuid_get(pbx_uuid, sizeof(pbx_uuid));
+
+			producer->specific.producer.forced_key = ast_strdup(pbx_uuid);
+			producer->specific.producer.force_null_key = 0;
+		} else if(0 == strcasecmp(sorcery_producer->key_overwrite, "value")) {
+			producer->specific.producer.forced_key = ast_strdup(sorcery_producer->key_value);
+			producer->specific.producer.force_null_key = 0;
+		} else if(0 == strcasecmp(sorcery_producer->key_overwrite, "null")) {
+			/* Force null key*/
+			producer->specific.producer.forced_key = NULL;
+			producer->specific.producer.force_null_key = 1;
+		} else if(0 == strcasecmp(sorcery_producer->key_overwrite, "no")) {
+			/* Use originator's key */
+			producer->specific.producer.forced_key = NULL;
+			producer->specific.producer.force_null_key = 0;
+		} else {
+			ast_log(LOG_WARNING, 
+				"Unknown key_overwrite value '%s'. Valid values are 'no', 'uuid', 'value', 'null'.\n", 
+				sorcery_producer->key_overwrite);
+			
+			/* Use originator's key */
+			producer->specific.producer.forced_key = NULL;
+			producer->specific.producer.force_null_key = 0;
+		}
+		
 		producer->timeout_ms = sorcery_producer->timeout_ms;
 		producer->partition = (sorcery_producer->partition < 0) ? RD_KAFKA_PARTITION_UA : sorcery_producer->partition;
 		producer->topic_count = 0;
@@ -1250,6 +1310,8 @@ static void kafka_producer_destructor(void *obj) {
 		ast_debug(3, "Destroy rd_kafka_t object %p on producer %p\n", producer->rd_kafka, producer);
 		rd_kafka_destroy(producer->rd_kafka);
 	}
+	
+	ast_free(producer->specific.producer.forced_key);
 }
 
 /*! Create new consumer service object */
@@ -1454,7 +1516,7 @@ static int service_add_property_string(rd_kafka_conf_t *config,
 static int process_producer_topic(struct kafka_service *producer, const struct sorcery_kafka_topic *sorcery_topic) {
 #if 1
 	RAII_VAR(struct kafka_topic *, topic, new_kafka_producer_topic(producer, sorcery_topic), ao2_cleanup);
-	RAII_VAR(struct ast_kafka_pipe *, pipe, ast_kafka_get_pipe(sorcery_topic->pipe, 1), ao2_cleanup);
+	RAII_VAR(struct ast_kafka_pipe *, pipe, ast_kafka_get_pipe(sorcery_topic->pipe_id, 1), ao2_cleanup);
 
 	if(pipe && topic) {
 		AST_LIST_LOCK(&pipe->producer_topics);
@@ -1470,7 +1532,7 @@ static int process_producer_topic(struct kafka_service *producer, const struct s
 		return 0;
 	} else {
 		ast_log(LOG_ERROR, "Unable to add producer topic '%s' to pipe '%s' - Out of memory\n", 
-			ast_sorcery_object_get_id(sorcery_topic), sorcery_topic->pipe);
+			ast_sorcery_object_get_id(sorcery_topic), sorcery_topic->pipe_id);
 
 		return -1;
 	}
@@ -1479,7 +1541,7 @@ static int process_producer_topic(struct kafka_service *producer, const struct s
 	struct kafka_topic *topic;
 	rd_kafka_resp_err_t response;
 
-	struct ast_kafka_pipe *pipe = ast_kafka_get_pipe(sorcery_topic->pipe, 1);
+	struct ast_kafka_pipe *pipe = ast_kafka_get_pipe(sorcery_topic->pipe_id, 1);
 	ao2_cleanup(pipe);
 
 	ast_debug(3, "Process Kafka topic %s for producer %p\n", ast_sorcery_object_get_id(sorcery_topic), producer);
@@ -1501,7 +1563,7 @@ static int process_producer_topic(struct kafka_service *producer, const struct s
 /*! Process Kafka consumer related topic at the cluster */
 static int process_consumer_topic(struct kafka_service *consumer, const struct sorcery_kafka_topic *sorcery_topic) {
 	RAII_VAR(struct kafka_topic *, topic, new_kafka_consumer_topic(consumer, sorcery_topic), ao2_cleanup);
-	RAII_VAR(struct ast_kafka_pipe *, pipe, ast_kafka_get_pipe(sorcery_topic->pipe, 1), ao2_cleanup);
+	RAII_VAR(struct ast_kafka_pipe *, pipe, ast_kafka_get_pipe(sorcery_topic->pipe_id, 1), ao2_cleanup);
 
 	if(pipe && topic) {
 		AST_LIST_LOCK(&pipe->consumer_topics);
@@ -1517,7 +1579,7 @@ static int process_consumer_topic(struct kafka_service *consumer, const struct s
 		return 0;
 	} else {
 		ast_log(LOG_ERROR, "Unable to add consumer topic '%s' to pipe '%s' - Out of memory\n", 
-			ast_sorcery_object_get_id(sorcery_topic), sorcery_topic->pipe);
+			ast_sorcery_object_get_id(sorcery_topic), sorcery_topic->pipe_id);
 
 		return -1;
 	}
@@ -2207,8 +2269,6 @@ static int load_module(void) {
 	AST_RWDLLIST_HEAD_INIT(&producers);
 	AST_RWDLLIST_HEAD_INIT(&consumers);
 
-        ast_pbx_uuid_get(pbx_uuid, sizeof(pbx_uuid));
-
 	update_global_producer_eid();
 	
 	if(NULL == (pipes = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, KAFKA_PIPE_BUCKETS, ast_kafka_pipe_hash_fn, NULL, ast_kafka_pipe_cmp_fn))) {
@@ -2275,7 +2335,7 @@ static int load_module(void) {
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
-	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "pipe", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_topic, pipe));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "pipe", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_topic, pipe_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "topic", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_topic, topic));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "producer", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_topic, producer_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_TOPIC, "consumer", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_topic, consumer_id));
@@ -2296,6 +2356,8 @@ static int load_module(void) {
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "cluster", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, cluster_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "timeout", "10000", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_producer, timeout_ms));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "partition", "-1", OPT_INT_T, 0, FLDSET(struct sorcery_kafka_producer, partition));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "key_overwrite", "no", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, key_overwrite));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "key_value", "no", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, key_value));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "request_required_acks", "-1", OPT_INT_T, 0, FLDSET(struct sorcery_kafka_producer, request_required_acks));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "max_in_flight_requests_per_connection", "1000000", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_producer, max_in_flight_requests_per_connection));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "message_send_max_retries", "2", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_producer, message_send_max_retries));
@@ -2402,8 +2464,6 @@ static int unload_module(void) {
 }
 
 static int reload_module(void) {
-        ast_pbx_uuid_get(pbx_uuid, sizeof(pbx_uuid));
-
 	update_global_producer_eid();
 	
 	ast_sorcery_reload(kafka_sorcery);

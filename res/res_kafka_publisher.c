@@ -43,11 +43,14 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 #include "asterisk/res_kafka.h"
 
 #include "asterisk/module.h"
-//#include "asterisk/sorcery.h"
 #include "asterisk/stasis.h"
 #include "asterisk/devicestate.h"
 #include "asterisk/stasis_app_device_state.h"
 #include "asterisk/utils.h"
+
+#include <string.h>
+
+#define KAFKA_PIPE_DEVICE_STATE "device_state"
 
 /* Fowrdwd local functions declaration */
 static void device_state_cb(void *data, struct stasis_subscription *sub, struct stasis_message *message);
@@ -61,7 +64,7 @@ static struct stasis_subscription *device_state_subscription;
 static void device_state_cb(void *data, struct stasis_subscription *sub, struct stasis_message *message) {
         struct ast_device_state_message *payload;
         enum ast_device_state state;
-        const char *device;
+        const char *device, *skip_tech;
 	RAII_VAR(struct ast_kafka_pipe *, pipe, NULL, ao2_cleanup);
 	
         if (stasis_message_type(message) != ast_device_state_message_type()) {
@@ -81,16 +84,21 @@ static void device_state_cb(void *data, struct stasis_subscription *sub, struct 
                 return;
         }
 
-	if(NULL != (pipe = ast_kafka_get_pipe("pipe_1",0))) {
+	if(NULL != (skip_tech = strchr(device, '/'))) {
+		/* skip_tech point to the '/' after channel tech */
+		device = skip_tech + sizeof(char);
+	}
+	
+	
+	if(NULL != (pipe = ast_kafka_get_pipe(KAFKA_PIPE_DEVICE_STATE,0))) {
 		RAII_VAR(struct ast_json *, json, stasis_app_device_state_to_json(device, state), ast_json_unref);
-		ast_kafka_publish(pipe, device, "peerstatus", json);
+		ast_kafka_publish(pipe, device, KAFKA_PIPE_DEVICE_STATE, json);
 	}
 	
 	ast_debug(3, "Device '%s' change state to %u '%s'.\n", device, state, ast_devstate_str(state));
 }
 
 static int load_module(void) {
-	
 	if(NULL == (device_state_subscription = stasis_subscribe(ast_device_state_topic_all(), 
 									device_state_cb, NULL))) {
 		return AST_MODULE_LOAD_DECLINE;
