@@ -94,9 +94,6 @@
 				<configOption name="sasl_password">
 					<synopsis>SASL authentication password</synopsis>
 				</configOption>
-				<configOption name="client_id" default="asterisk">
-					<synopsis>Client id for this connection</synopsis>
-				</configOption>
 			</configObject>
  
 			<configObject name="producer">
@@ -159,9 +156,6 @@
 						<para>Default value: 100</para>
 					</description>
 				</configOption>
-				<configOption name="client_id">
-					<synopsis>Client id (default from cluster configuration)</synopsis>
-				</configOption>
 				<configOption name="debug">
 					<synopsis>Comma-separated list of debug contexts to enable</synopsis>
 				</configOption>
@@ -204,9 +198,6 @@
 							<enum name="read_uncommitted" />
 						</enumlist>
 					</description>
-				</configOption>
-				<configOption name="client_id">
-					<synopsis>Client id (default from cluster configuration)</synopsis>
 				</configOption>
 				<configOption name="debug">
 					<synopsis>Comma-separated list of debug contexts to enable</synopsis>
@@ -308,8 +299,6 @@ struct sorcery_kafka_cluster {
 		AST_STRING_FIELD(sasl_username);
 		/*! SASL authentication password */
 		AST_STRING_FIELD(sasl_password);
-		/*! Client identifier */
-		AST_STRING_FIELD(client_id);
 	);
 };
 
@@ -323,8 +312,6 @@ struct sorcery_kafka_producer {
 		AST_STRING_FIELD(key_overwrite);
 		/*! Producer's static key value */
 		AST_STRING_FIELD(key_value);
-		/*! Client identifier */
-		AST_STRING_FIELD(client_id);
 		/*! transactional.id */
 		AST_STRING_FIELD(transactional_id);
 		/*! Comma separated contexts for debug */
@@ -352,8 +339,6 @@ struct sorcery_kafka_consumer {
 	AST_DECLARE_STRING_FIELDS(
 		/*! Cluster resource id */
 		AST_STRING_FIELD(cluster_id);
-		/*! Client identifier */
-		AST_STRING_FIELD(client_id);
 		/*! Client group id */
 		AST_STRING_FIELD(group_id);
 		/*! isolation.level */
@@ -1293,7 +1278,7 @@ static struct kafka_service *new_kafka_producer(const struct sorcery_kafka_clust
 			return NULL;
 		}
 
-		if(service_add_property_string(config, "client.id", S_OR(sorcery_producer->client_id, sorcery_cluster->client_id), service_type, service_id, cluster_id)) {
+		if(service_add_property_string(config, "client.id", ast_sorcery_object_get_id(sorcery_producer), service_type, service_id, cluster_id)) {
 			rd_kafka_conf_destroy(config);
 			return NULL;
 		}		
@@ -1417,7 +1402,7 @@ static struct kafka_service *new_kafka_consumer(const struct sorcery_kafka_clust
 			return NULL;
 		}		
 		
-		if(service_add_property_string(config, "client.id", S_OR(sorcery_consumer->client_id, sorcery_cluster->client_id), service_type, service_id, cluster_id)) {
+		if(service_add_property_string(config, "client.id", ast_sorcery_object_get_id(sorcery_consumer), service_type, service_id, cluster_id)) {
 			rd_kafka_conf_destroy(config);
 			return NULL;
 		}		
@@ -2336,7 +2321,7 @@ static void sorcery_kafka_consumer_destructor(void *obj) {
 static int sorcery_kafka_cluster_apply_handler(const struct ast_sorcery *sorcery, void *obj) {
 	struct sorcery_kafka_cluster *cluster = obj;
 
-	ast_debug(3, "Apply Kafka cluster %s (%p): brokers=%s client_id=%s\n", ast_sorcery_object_get_id(cluster), cluster, cluster->brokers, cluster->client_id);
+	ast_debug(3, "Apply Kafka cluster %s (%p): brokers=%s\n", ast_sorcery_object_get_id(cluster), cluster, cluster->brokers);
 
 #if 0
 	if(NULL != producer) {
@@ -2529,7 +2514,6 @@ static int load_module(void) {
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CLUSTER, "sasl_mechanism", "PLAIN", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_cluster, sasl_mechanism));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CLUSTER, "sasl_username", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_cluster, sasl_username));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CLUSTER, "sasl_password", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_cluster, sasl_password));
-	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CLUSTER, "client_id", "asterisk", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_cluster, client_id));
 
 	if(sorcery_object_register(KAFKA_TOPIC, sorcery_kafka_topic_alloc, sorcery_kafka_topic_apply_handler)) {
 		ast_sorcery_unref(kafka_sorcery);
@@ -2574,7 +2558,6 @@ static int load_module(void) {
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "retry_backoff_ms", "100", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_producer, retry_backoff_ms));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "enable_idempotence", "no", OPT_BOOL_T, 1, FLDSET(struct sorcery_kafka_producer, enable_idempotence));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "transactional_id", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, transactional_id));
-	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "client_id", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, client_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_PRODUCER, "debug", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_producer, debug));
 
 
@@ -2615,7 +2598,6 @@ static int load_module(void) {
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "partition", "-1", OPT_INT_T, 0, FLDSET(struct sorcery_kafka_consumer, partition));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "enable_auto_commit", "yes", OPT_BOOL_T, 1, FLDSET(struct sorcery_kafka_consumer, enable_auto_commit));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "auto_commit_interval", "5000", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_consumer, auto_commit_interval_ms));
-	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "client_id", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, client_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "debug", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, debug));
 
 
