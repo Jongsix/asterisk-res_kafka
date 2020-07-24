@@ -1963,7 +1963,9 @@ static void *monitor_thread_job(void *opaque) {
 				processed++;
 				
 				if(RD_KAFKA_RESP_ERR_NO_ERROR == rkm->err) {
-					ast_debug(3, "Got consumer MESSAGE from offset %lu\n", rkm->offset);					
+					const char *topic_name = rd_kafka_topic_name(rkm->rkt);
+
+					ast_debug(3, "Got consumer MESSAGE from topic '%s' at offset %lu\n", topic_name, rkm->offset);					
 				} else {
 					ast_debug(3, "Got consumer error %d: %s\n", rkm->err, rd_kafka_err2str(rkm->err));
 				}
@@ -2047,7 +2049,9 @@ static void on_producer_message_processed(rd_kafka_t *rd_kafka, const rd_kafka_m
 	
 	if(RD_KAFKA_RESP_ERR_NO_ERROR == message->err) {
 		/* Message successfully sent to the broker */
-		ast_debug(3, "Message sent to the topic '%s'\n", rd_kafka_topic_name(message->rkt));
+		const char *topic_name = rd_kafka_topic_name(message->rkt);
+		
+		ast_debug(3, "Message sent to the topic '%s'\n", topic_name);
 	} else {
 		/* Producer's message sending fatal error occured*/
 		ast_log(LOG_ERROR, "Unable to sent message to the topic '%s' by '%s'. Reason: %s\n", 
@@ -2062,8 +2066,10 @@ static void on_consumer_message_processed(rd_kafka_t *rd_kafka, const rd_kafka_m
 
 //	ast_debug(3,"on_consumer_message_processed(%p, %p, %p)\n", rd_kafka, message, opaque);
 	if(RD_KAFKA_RESP_ERR_NO_ERROR == message->err) {
-		/* Message successfully sent to the broker */
-		ast_debug(3, "Message received from the topic '%s'\n", rd_kafka_topic_name(message->rkt));
+		/* Message successfully received from the broker */
+		const char *topic_name = rd_kafka_topic_name(message->rkt);
+
+		ast_debug(3, "Message received from the topic '%s'\n", topic_name);
 	} else {
 		/* Producer's message sending fatal error occured*/
 		ast_log(LOG_ERROR, "Unable to receive message from the topic '%s' by '%s'. Reason: %s\n", 
