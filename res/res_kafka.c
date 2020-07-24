@@ -175,8 +175,8 @@
 				<configOption name="cluster">
 					<synopsis>Cluster resource id</synopsis>
 				</configOption>
-				<configOption name="group_id" default="asterisk">
-					<synopsis>Client group id string. All clients sharing the same group_id belong to the same group. Default is 'asterisk'.</synopsis>
+				<configOption name="group_id">
+					<synopsis>Client group id string. All clients sharing the same group_id belong to the same group. Default is none.</synopsis>
 				</configOption>
 				<configOption name="timeout" default="10000">
 					<synopsis>Default service timeout, ms. Default 10000ms.</synopsis>
@@ -413,6 +413,8 @@ struct kafka_service {
 		struct {
 			/*! Consumer message queue */
 			rd_kafka_queue_t *queue;
+			/*! If non-NULL we are use high-level consumer */
+			rd_kafka_topic_partition_list_t *topic_partition_list;
 		} consumer;
 	} specific;
 };
@@ -1196,6 +1198,36 @@ static int process_consumer(const struct sorcery_kafka_cluster *sorcery_cluster,
 				ao2_iterator_destroy(&i);
 
 				if(consumer->topic_count) {
+					if(consumer->specific.consumer.topic_partition_list) {
+						/* High-level consumer, initiate subscription */
+						rd_kafka_resp_err_t response = rd_kafka_subscribe(consumer->rd_kafka, consumer->specific.consumer.topic_partition_list);
+						
+						if(RD_KAFKA_RESP_ERR_NO_ERROR == response) {
+							ast_debug(3, "Subscribed to %d topic(s), waiting for rebalance and messages...\n", consumer->specific.consumer.topic_partition_list->cnt);
+						} else {
+							ast_log(LOG_ERROR, "Consumer '%s': unable to subscribe topics because %s\n", ast_sorcery_object_get_id(sorcery_consumer), rd_kafka_err2str(response));
+							
+							/* Consumer not usable */
+							ao2_ref(consumer, -1);
+							
+							return -1;
+						}
+
+						/* At this point we safe to free topic-partition list */
+						rd_kafka_topic_partition_list_destroy(consumer->specific.consumer.topic_partition_list);
+						consumer->specific.consumer.topic_partition_list = NULL;
+						
+						/* Redirect all messages from per-partition queues to
+						 * the main queue so that messages can be consumed with one
+						 * call from all assigned partitions.
+						 *
+						 * The alternative is to poll the main queue (for events)
+						 * and each partition queue separately, which requires setting
+						 * up a rebalance callback and keeping track of the assignment:
+						 * but that is more complex and typically not recommended. */
+						rd_kafka_poll_set_consumer(consumer->rd_kafka);
+					}
+					
 					AST_RWDLLIST_WRLOCK(&consumers);
 
 					/* Keep object reference count because list reference to it */
@@ -1354,14 +1386,20 @@ static struct kafka_service *new_kafka_consumer(const struct sorcery_kafka_clust
 		return NULL;
 	} else {
 		/* Set consumer-specific configuration options */
-		static const char *service_type = "producer";
+		static const char *service_type = "consumer";
 		const char *service_id = ast_sorcery_object_get_id(sorcery_consumer);
 		const char *cluster_id = ast_sorcery_object_get_id(sorcery_cluster);
 
-		if(service_add_property_string(config, "group.id", sorcery_consumer->group_id, service_type, service_id, cluster_id)) {
-			rd_kafka_conf_destroy(config);
-			return NULL;
-		}		
+		if(ast_strlen_zero(sorcery_consumer->group_id)) {
+			ast_log(LOG_WARNING, 
+				"Kafka low-level consumers not supported yet. Please specify 'group_id' option for consumer '%s'\n", 
+				service_id);
+		} else {		
+			if(service_add_property_string(config, "group.id", sorcery_consumer->group_id, service_type, service_id, cluster_id)) {
+				rd_kafka_conf_destroy(config);
+				return NULL;
+			}	
+		}
 
 		if(service_add_property_string(config, "enable.auto.commit", sorcery_consumer->enable_auto_commit ? "true" : "false", service_type, service_id, cluster_id)) {
 			rd_kafka_conf_destroy(config);
@@ -1395,8 +1433,21 @@ static struct kafka_service *new_kafka_consumer(const struct sorcery_kafka_clust
 	} else {
 		char *errstr = ast_alloca(KAFKA_ERRSTR_MAX_SIZE);
 
+		consumer->rd_kafka = NULL;
 		consumer->specific.consumer.queue = NULL;
 
+		if(ast_strlen_zero(sorcery_consumer->group_id)) {
+			/* Low-level consumer */
+			consumer->specific.consumer.topic_partition_list = NULL;
+		} else {
+			/* High-level consumer, default for 1 topic (can be extended when need) */
+			if(NULL == (consumer->specific.consumer.topic_partition_list = rd_kafka_topic_partition_list_new(1))) {
+				rd_kafka_conf_destroy(config);
+				ao2_cleanup(consumer);
+				return NULL;
+			}
+		}
+		
 		consumer->timeout_ms = sorcery_consumer->timeout_ms;
 		consumer->partition = (sorcery_consumer->partition < 0) ? RD_KAFKA_PARTITION_UA : sorcery_consumer->partition;
 		consumer->topic_count = 0;
@@ -1440,6 +1491,11 @@ static struct kafka_service *new_kafka_consumer(const struct sorcery_kafka_clust
 static void kafka_consumer_destructor(void *obj) {
 	struct kafka_service *consumer = obj;
 
+	if(consumer->specific.consumer.topic_partition_list) {
+		/* Subscription list still exist */
+		rd_kafka_topic_partition_list_destroy(consumer->specific.consumer.topic_partition_list);
+	}
+	
 	if(consumer->specific.consumer.queue) {
 		rd_kafka_queue_destroy(consumer->specific.consumer.queue);
 	}
@@ -1641,6 +1697,11 @@ static struct kafka_topic *new_kafka_producer_topic(struct kafka_service *produc
 		/* With topic's callbacks we want see the kafka_producer_topic structure reference */
 		rd_kafka_topic_conf_set_opaque(config, topic);
 
+		topic_add_property_string(config, 
+						"offset.store.method", "broker",
+						ast_sorcery_object_get_id(sorcery_topic));
+		
+		
 		if(topic_add_property_uint(config, 
 						"message.timeout.ms", sorcery_topic->message_timeout_ms,
 						ast_sorcery_object_get_id(sorcery_topic))) {
@@ -1713,45 +1774,59 @@ static struct kafka_topic *new_kafka_consumer_topic(struct kafka_service *consum
 	if(NULL == topic) {
 		ast_log(LOG_ERROR, "Out of memory while create consumer topic '%s'\n", ast_sorcery_object_get_id(sorcery_topic));
 	} else {
-		rd_kafka_topic_conf_t *config = rd_kafka_topic_conf_new();
-
 		topic->rd_kafka_topic = NULL;
 
-		if(NULL == config) {
-			ast_log(LOG_ERROR, "Unable to create config for consumer topic '%s'\n", ast_sorcery_object_get_id(sorcery_topic));
-			ao2_ref(topic, -1);
-			return NULL;
+		if(consumer->specific.consumer.topic_partition_list) {
+			/* High-level consumer */
+			if(NULL == rd_kafka_topic_partition_list_add(consumer->specific.consumer.topic_partition_list,
+									sorcery_topic->topic,
+									/* the partition is ignored
+									* by subscribe() */
+									RD_KAFKA_PARTITION_UA)) {
+				ast_log(LOG_ERROR, "Pipe '%s': Unable to add consumer topic '%s' to the subscription list.\n", sorcery_topic->pipe_id, sorcery_topic->topic);
+				ao2_ref(topic, -1);
+				return NULL;
+			}
+		} else {
+			/* Low-level consumer */
+			rd_kafka_topic_conf_t *config = rd_kafka_topic_conf_new();
+
+			if(NULL == config) {
+				ast_log(LOG_ERROR, "Unable to create config for consumer topic '%s'\n", ast_sorcery_object_get_id(sorcery_topic));
+				ao2_ref(topic, -1);
+				return NULL;
+			}
+
+			/* With topic's callbacks we want see the kafka_producer_topic structure reference */
+			rd_kafka_topic_conf_set_opaque(config, topic);
+
+			if(NULL == (topic->rd_kafka_topic = rd_kafka_topic_new(consumer->rd_kafka, sorcery_topic->topic, config))) {
+				ast_log(LOG_ERROR, "Unable to create consumer topic '%s' because %s\n", ast_sorcery_object_get_id(sorcery_topic), rd_kafka_err2str(rd_kafka_last_error()));
+				rd_kafka_topic_conf_destroy(config);
+
+				/* This object not usable */
+				ao2_ref(topic, -1);
+				return NULL;
+			}
+
+			/* Start consuming from end of kafka partition queue: next msg */
+	#if 1
+			if(rd_kafka_consume_start_queue(topic->rd_kafka_topic, consumer->partition, RD_KAFKA_OFFSET_BEGINNING, consumer->specific.consumer.queue) < 0) {
+	#else
+			if(rd_kafka_consume_start(topic->rd_kafka_topic, consumer->partition, RD_KAFKA_OFFSET_END) < 0) {
+	#endif
+				ast_log(LOG_ERROR, "Unable to start consuming topic '%s' because %s\n", ast_sorcery_object_get_id(sorcery_topic), rd_kafka_err2str(rd_kafka_last_error()));
+
+				/* Destroy librdkafka topic object */
+				rd_kafka_topic_destroy(topic->rd_kafka_topic);
+				topic->rd_kafka_topic = NULL;
+
+				/* This object not usable */
+				ao2_ref(topic, -1);
+				return NULL;
+			}
 		}
-
-		/* With topic's callbacks we want see the kafka_producer_topic structure reference */
-		rd_kafka_topic_conf_set_opaque(config, topic);
-
-		if(NULL == (topic->rd_kafka_topic = rd_kafka_topic_new(consumer->rd_kafka, sorcery_topic->topic, config))) {
-			ast_log(LOG_ERROR, "Unable to create consumer topic '%s' because %s\n", ast_sorcery_object_get_id(sorcery_topic), rd_kafka_err2str(rd_kafka_last_error()));
-			rd_kafka_topic_conf_destroy(config);
-
-			/* This object not usable */
-			ao2_ref(topic, -1);
-			return NULL;
-		}
-
-		/* Start consuming from end of kafka partition queue: next msg */
-#if 1
-		if(rd_kafka_consume_start_queue(topic->rd_kafka_topic, consumer->partition, RD_KAFKA_OFFSET_BEGINNING, consumer->specific.consumer.queue) < 0) {
-#else
-		if(rd_kafka_consume_start(topic->rd_kafka_topic, consumer->partition, RD_KAFKA_OFFSET_END) < 0) {
-#endif
-			ast_log(LOG_ERROR, "Unable to start consuming topic '%s' because %s\n", ast_sorcery_object_get_id(sorcery_topic), rd_kafka_err2str(rd_kafka_last_error()));
-
-			/* Destroy librdkafka topic object */
-			rd_kafka_topic_destroy(topic->rd_kafka_topic);
-			topic->rd_kafka_topic = NULL;
-
-			/* This object not usable */
-			ao2_ref(topic, -1);
-			return NULL;
-		}
-
+		
 		/* Topic handle created, link this object to the service */
 		topic->service = consumer;
 		ao2_ref(consumer, +1);
@@ -1786,6 +1861,11 @@ static void kafka_consumer_topic_destructor(void *obj) {
 		AST_RWDLLIST_UNLOCK(&consumers);
 
 		if(last_topic) {
+			if(NULL == topic->rd_kafka_topic) {
+				/* High-level consumer */
+				rd_kafka_consumer_close(consumer->rd_kafka);
+			}
+			
 			/* Wait for messages to be delivered */
 			while(rd_kafka_outq_len(consumer->rd_kafka) > 0) {
 				ast_debug(3, "Consumer %p have %u outstanding message(s), wait %ums\n", 
@@ -1890,6 +1970,22 @@ static void *monitor_thread_job(void *opaque) {
 
 		AST_RWDLLIST_RDLOCK(&consumers);
 		AST_DLLIST_TRAVERSE(&consumers, service, link) {
+			rd_kafka_message_t *rkm;
+			
+			active++;
+			
+			if(NULL != (rkm = rd_kafka_consumer_poll(service->rd_kafka, 0))) {
+				processed++;
+				
+				if(RD_KAFKA_RESP_ERR_NO_ERROR == rkm->err) {
+					ast_debug(3, "Got consumer MESSAGE from offset %lu\n", rkm->offset);					
+				} else {
+					ast_debug(3, "Got consumer error %d: %s\n", rkm->err, rd_kafka_err2str(rkm->err));
+				}
+				
+				rd_kafka_message_destroy(rkm);
+			}
+#if 0			
 #if 0
 			rd_kafka_message_t* msg = rd_kafka_consumer_poll(service->rd_kafka, 0);
 
@@ -1935,6 +2031,7 @@ static void *monitor_thread_job(void *opaque) {
 
 			/* Process consumer events */
 			processed += rd_kafka_poll(service->rd_kafka, 0);
+#endif
 #endif
 		}
 		AST_RWDLLIST_UNLOCK(&consumers);
@@ -2512,7 +2609,7 @@ static int load_module(void) {
 	}
 
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "cluster", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, cluster_id));
-	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "group_id", "asterisk", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, group_id));
+	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "group_id", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, group_id));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "isolation_level", "read_committed", OPT_STRINGFIELD_T, 0, STRFLDSET(struct sorcery_kafka_consumer, isolation_level));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "timeout", "10000", OPT_UINT_T, 0, FLDSET(struct sorcery_kafka_consumer, timeout_ms));
 	ast_sorcery_object_field_register(kafka_sorcery, KAFKA_CONSUMER, "partition", "-1", OPT_INT_T, 0, FLDSET(struct sorcery_kafka_consumer, partition));
