@@ -21,9 +21,11 @@
 #ifndef _ASTERISK_RES_KAFKA_H
 #define _ASTERISK_RES_KAFKA_H
 
-#include "asterisk/json.h"
+#include <asterisk/json.h>
+#include <asterisk/stasis.h>
 
 struct ast_kafka_pipe;
+struct ast_kafka_consumer_message;
 
 /*!
  * \brief Publish event to the specified pipe.
@@ -85,5 +87,33 @@ int ast_kafka_send_raw_message(struct ast_kafka_pipe *pipe, const char *key,
  * 
  */
 struct ast_kafka_pipe *ast_kafka_get_pipe(const char *pipe_id, int force);
+
+/*!
+ * \brief Get stasis topic from the pipe.
+ * 
+ * \details
+ * Get stasis topic from the pipe.
+ * Kafka consumers, attached to this pipe, forward received messages to this
+ * topic.
+ * 
+ * \note
+ * 
+ * \param pipe
+ * 
+ * \return Stasis message topic, associated to this pipe
+ */
+struct stasis_topic *ast_kafka_get_stasis_topic(struct ast_kafka_pipe *pipe);
+
+/*!
+ * \brief Get Kafka consumer stasis message type.
+ * 
+ * \details
+ * Get Kafka consumer stasis message type.
+ * 
+ * \note
+ * 
+ * \return Stasis message type
+ */
+struct stasis_message_type *ast_kafka_consumer_message_type(void);
 
 #endif /* _ASTERISK_RES_KAFKA_H */
