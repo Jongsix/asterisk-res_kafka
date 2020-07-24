@@ -543,6 +543,7 @@ static void sorcery_kafka_cluster_destructor(void *obj);
 static void *kafka_pipe_alloc(const char *pipe_id);
 static void kafka_pipe_destructor(void *obj);
 
+static void rdkafka_logger(const rd_kafka_t *rk, int level, const char *fac, const char *buf);
 static void update_global_producer_eid(void);
 static void clear_global_producer_eid(void);
 
@@ -1461,6 +1462,9 @@ static rd_kafka_conf_t *build_rdkafka_cluster_config(const struct sorcery_kafka_
 		return NULL;
 	}
 
+	/* Set our logger */
+	rd_kafka_conf_set_log_cb(config, rdkafka_logger);
+	
 	if(RD_KAFKA_CONF_OK != rd_kafka_conf_set(config, "metadata.broker.list", cluster->brokers, errstr, KAFKA_ERRSTR_MAX_SIZE)) {
 		ast_log(LOG_ERROR, "Kafka cluster %s: unable to set bootstrap brokers because %s\n", ast_sorcery_object_get_id(cluster), errstr);
 		rd_kafka_conf_destroy(config);
@@ -2337,6 +2341,11 @@ static void kafka_pipe_destructor(void *obj) {
 	ast_debug(3, "Destroyed Kafka pipe %s (%p)\n", pipe->id, pipe);
 
 	ast_string_field_free_memory(pipe);
+}
+
+/*! librdkafka logger callback */
+static void rdkafka_logger(const rd_kafka_t *rk, int level, const char *fac, const char *buf) {
+	ast_debug(4, "rdkafka %p: %d %s -- %s\n", rk, level, fac, buf);
 }
 
 /*! Update global producer's EID */
