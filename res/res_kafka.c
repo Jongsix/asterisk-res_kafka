@@ -1549,7 +1549,7 @@ static struct kafka_service *new_kafka_service(void (*service_destructor)(void *
 		memset(&service->specific, 0, sizeof(service->specific));
 		
 		/* Build topic storage */
-		if(NULL == (service->topics = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, KAFKA_TOPIC_BUCKETS, kafka_topic_hash_fn, NULL, kafka_topic_cmp_fn))) {
+		if(NULL == (service->topics = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_RWLOCK, 0, KAFKA_TOPIC_BUCKETS, kafka_topic_hash_fn, NULL, kafka_topic_cmp_fn))) {
 			/* Service not usable */
 			ao2_ref(service, -1);
 			return NULL;
@@ -1662,6 +1662,9 @@ static int process_producer_topic(struct kafka_service *producer, const struct s
 	RAII_VAR(struct ast_kafka_pipe *, pipe, ast_kafka_get_pipe(sorcery_topic->pipe_id, 1), ao2_cleanup);
 
 	if(pipe && topic) {
+		/* Add topic to the service storage */
+		ao2_link(producer->topics, topic);
+
 		AST_LIST_LOCK(&pipe->producer_topics);
 
 		/* Add new topic to the specified pipe */
@@ -1671,7 +1674,7 @@ static int process_producer_topic(struct kafka_service *producer, const struct s
 		ao2_ref(topic, +1);
 
 		AST_LIST_UNLOCK(&pipe->producer_topics);
-
+		
 		return 0;
 	} else {
 		ast_log(LOG_ERROR, "Unable to add producer topic '%s' to pipe '%s' - Out of memory\n", 
@@ -1709,6 +1712,9 @@ static int process_consumer_topic(struct kafka_service *consumer, const struct s
 	RAII_VAR(struct ast_kafka_pipe *, pipe, ast_kafka_get_pipe(sorcery_topic->pipe_id, 1), ao2_cleanup);
 
 	if(pipe && topic) {
+		/* Add topic to the service storage */
+		ao2_link(consumer->topics, topic);
+		
 		AST_LIST_LOCK(&pipe->consumer_topics);
 
 		/* Add new topic to the specified pipe */
@@ -2052,8 +2058,9 @@ static void *monitor_thread_job(void *opaque) {
 				
 				if(RD_KAFKA_RESP_ERR_NO_ERROR == rkm->err) {
 					const char *topic_name = rd_kafka_topic_name(rkm->rkt);
+					RAII_VAR(struct kafka_topic *, topic, ao2_find(service->topics, topic_name, OBJ_SEARCH_KEY), ao2_cleanup);
 
-					ast_debug(3, "Got consumer MESSAGE from topic '%s' at offset %lu\n", topic_name, rkm->offset);					
+					ast_debug(3, "Got consumer MESSAGE from topic '%s' at offset %lu, topic pvt=%p\n", topic_name, rkm->offset, topic);	
 				} else {
 					ast_debug(3, "Got consumer error %d: %s\n", rkm->err, rd_kafka_err2str(rkm->err));
 				}
